@@ -2,9 +2,14 @@
 
 In GitHub Actions, run **Publish image** on **main** and select `dev` or `release`.
 
-The image version is always the checked-out WorkOS `package.json` version plus
+By default the image version is the checked-out WorkOS `package.json` version plus
 one patch: upstream `0.4.2` produces `0.4.3-dev` or `0.4.3-release`. The package
 version itself is unchanged. Sync upstream changes into the fork before publishing.
+
+To publish a fork-only change without a new upstream version, set the optional
+**version** input (`x.y.z`, for example `0.4.4`). It replaces the derived version,
+so the tag becomes `0.4.4-dev`. Pick a version above the last published one, or
+the Kubernetes updater will not roll it out.
 
 The workflow reuses the repository's CI checks, Dockerfile, image secret scan,
 and smoke test, then pushes the built `linux/amd64` image to:

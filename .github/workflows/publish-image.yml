@@ -11,6 +11,11 @@ on:
         options:
           - dev
           - release
+      version:
+        description: Image version (x.y.z). Empty = upstream package.json patch + 1
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -45,8 +50,17 @@ jobs:
         id: tag
         env:
           SUFFIX: ${{ inputs.suffix }}
+          VERSION_OVERRIDE: ${{ inputs.version }}
         run: |
-          VERSION=$(node -p 'const [major, minor, patch] = require("./package.json").version.split(".").map(Number); [major, minor, patch + 1].join(".")')
+          if [[ -n "$VERSION_OVERRIDE" ]]; then
+            if [[ ! "$VERSION_OVERRIDE" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "Version must be x.y.z, got: $VERSION_OVERRIDE" >&2
+              exit 1
+            fi
+            VERSION="$VERSION_OVERRIDE"
+          else
+            VERSION=$(node -p 'const [major, minor, patch] = require("./package.json").version.split(".").map(Number); [major, minor, patch + 1].join(".")')
+          fi
           if [[ "$SUFFIX" != dev && "$SUFFIX" != release ]]; then
             echo "Suffix must be dev or release" >&2
             exit 1
