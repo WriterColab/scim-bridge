@@ -1,5 +1,9 @@
 # Releasing scim-bridge
 
+For the WriterColab fork and Writer Artifact Registry, follow
+[Writer image publishing](writer-releasing.md). The WorkOS GHCR workflow below
+is restricted to the upstream repository.
+
 Cutting a release is one command. This page says what that command sets in
 motion, what a consumer is expected to pin to, and which steps a human still has
 to take — because several of them are permission changes no workflow can make

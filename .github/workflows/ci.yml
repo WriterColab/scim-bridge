@@ -4,6 +4,11 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_call:
+    inputs:
+      skip-image:
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -39,10 +44,13 @@ jobs:
           node-version: 26
           cache: npm
       - name: Setup Socket Firewall
+        if: github.repository == 'workos/scim-bridge'
         uses: workos/setup-socket-firewall@195977cfa38ab4d70363af5403a106dbc54a61eb
         with:
           token: ${{ secrets.PUBLIC_SOCKET_FIREWALL_TOKEN }}
           allow-external-fork-fallback: ${{ github.event_name == 'pull_request' }}
+      - name: Test Writer image publishing guards
+        run: node --test .github/scripts/writer-image.test.mjs
       - run: npm ci
       # Every dependency must come from the public registry: this repo is
       # published, and an internal proxy URL installs for nobody else (#45).
@@ -65,3 +73,13 @@ jobs:
       # pass on Postgres" turns into "don't run it on Postgres".
       - run: npm run test:engines
       - run: npm run build
+
+  image:
+    if: github.repository == 'WriterColab/scim-bridge' && !inputs.skip-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/check-writer-image

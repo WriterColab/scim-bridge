@@ -1,0 +1,14 @@
+name: Setup Writer GCP Docker
+description: Authenticate using the same Workload Identity as identity service
+runs:
+  using: composite
+  steps:
+    - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+      with:
+        workload_identity_provider: projects/788018447969/locations/global/workloadIdentityPools/writer-iam-wip/providers/github-gar-write-20240221
+        service_account: github-gar-write-20240221@writer-iam.iam.gserviceaccount.com
+        token_format: access_token
+        access_token_lifetime: 900s
+    - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+    - shell: bash
+      run: gcloud --quiet auth configure-docker us-docker.pkg.dev

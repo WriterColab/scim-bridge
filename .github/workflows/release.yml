@@ -58,7 +58,7 @@ jobs:
     # A release-only dispatch (backfilling notes for an old tag) must not
     # rebuild and republish that tag's image: the bits people already pulled
     # would be replaced by whatever main builds today.
-    if: github.event_name != 'workflow_dispatch' || inputs.tag == ''
+    if: github.repository == 'workos/scim-bridge' && (github.event_name != 'workflow_dispatch' || inputs.tag == '')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -273,6 +273,7 @@ jobs:
     needs: docker
     if: |
       !cancelled()
+      && github.repository == 'workos/scim-bridge'
       && (needs.docker.result == 'success' || needs.docker.result == 'skipped')
       && (startsWith(github.ref, 'refs/tags/v') || inputs.tag != '')
     runs-on: ubuntu-latest

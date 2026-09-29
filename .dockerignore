@@ -11,6 +11,7 @@
 .dev.vars
 .dev.vars.*
 *.pem
+gha-creds-*.json
 data
 .localdata
 *.db
