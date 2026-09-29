@@ -26,7 +26,7 @@ import {
   seedNativeAppConfig,
   seedNativeAppDirectories,
 } from "./config";
-import { panelCsrfGuard } from "./csrf";
+import { panelCsrfGuard, withOriginScheme } from "./csrf";
 import { openDatabase, SqliteDatastore, SqliteMigrator } from "./db/sqlite";
 import { inspectStorage } from "./db/storage-durability";
 import { openPostgres, PostgresDatastore, PostgresMigrator } from "./db/postgres";
@@ -249,7 +249,7 @@ async function mountBridge(): Promise<void> {
     const context = new RouterContextProvider();
     context.set(datastoreContext, store);
     context.set(demoModeContext, config.demoMode);
-    return requestHandler(c.req.raw, context);
+    return requestHandler(withOriginScheme(c.req.raw), context);
   });
 }
 

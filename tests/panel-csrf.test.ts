@@ -1,7 +1,12 @@
 import { Hono } from "hono";
 import { describe, expect, it } from "vitest";
 import { loadConfig } from "../server/config";
-import { decidePanelCsrf, isMutatingMethod, panelCsrfGuard } from "../server/csrf";
+import {
+  decidePanelCsrf,
+  isMutatingMethod,
+  panelCsrfGuard,
+  withOriginScheme,
+} from "../server/csrf";
 
 /**
  * The panel is behind HTTP Basic auth, and browsers re-attach Basic credentials
@@ -161,5 +166,88 @@ describe("panelCsrfGuard middleware", () => {
     const res = await app.request(post("/panel", { "Sec-Fetch-Site": "cross-site" }));
     expect(res.status).toBe(200);
     expect(mutatedAfter()).toBe(true);
+  });
+});
+
+describe("withOriginScheme", () => {
+  // Behind a TLS terminator the server sees http:// but the browser sends an
+  // https:// Origin; React Router >= 8.3.1 rejects that scheme mismatch with 400.
+  const post = (
+    url: string,
+    origin: string | null,
+    method: "POST" | "PUT" | "PATCH" | "DELETE" = "POST",
+  ) => new Request(url, { method, headers: origin === null ? {} : { Origin: origin } });
+
+  it("upgrades a same-host action to the Origin's https scheme", async () => {
+    const req = new Request("http://scim.acme.com/panel/directories/d1.data?index", {
+      method: "POST",
+      headers: { Origin: PANEL_ORIGIN },
+      body: "intent=topology",
+    });
+    const out = withOriginScheme(req);
+    expect(out.url).toBe("https://scim.acme.com/panel/directories/d1.data?index");
+    expect(out.method).toBe("POST");
+    expect(out.headers.get("Origin")).toBe(PANEL_ORIGIN);
+    expect(await out.text()).toBe("intent=topology");
+  });
+
+  it("treats a forwarded :443 as the browser's default https port", () => {
+    const out = withOriginScheme(post("http://scim.acme.com:443/panel.data", PANEL_ORIGIN));
+    expect(out.url).toBe("https://scim.acme.com/panel.data");
+  });
+
+  it("keeps a matching non-default port", () => {
+    const out = withOriginScheme(post("http://[::1]:8443/panel.data", "https://[::1]:8443"));
+    expect(out.url).toBe("https://[::1]:8443/panel.data");
+  });
+
+  it("covers every mutating method", () => {
+    for (const method of ["PUT", "PATCH", "DELETE"] as const) {
+      const out = withOriginScheme(post("http://scim.acme.com/panel", PANEL_ORIGIN, method));
+      expect(out.url).toBe("https://scim.acme.com/panel");
+    }
+  });
+
+  it("preserves Request metadata", () => {
+    const req = new Request("http://scim.acme.com/panel", {
+      method: "POST",
+      headers: { Origin: PANEL_ORIGIN, Authorization: "Basic eDp5" },
+      redirect: "manual",
+      cache: "no-store",
+    });
+    const out = withOriginScheme(req);
+    expect(out.url).toBe("https://scim.acme.com/panel");
+    expect(out.headers.get("Authorization")).toBe("Basic eDp5");
+    expect(out.redirect).toBe("manual");
+    expect(out.cache).toBe("no-store");
+  });
+
+  it("leaves everything but a same-origin http -> https upgrade untouched", () => {
+    const untouched: Array<[string, string | null]> = [
+      // Different host or port: React Router must still refuse these.
+      ["http://scim.acme.com/panel", "https://evil.example"],
+      ["http://scim.acme.com:8080/panel", "https://scim.acme.com:8443"],
+      // Already matching.
+      [`${PANEL_ORIGIN}/panel`, PANEL_ORIGIN],
+      // Never a downgrade.
+      [`${PANEL_ORIGIN}/panel`, "http://scim.acme.com"],
+      // Not an https Origin.
+      ["http://scim.acme.com/panel", "ftp://scim.acme.com"],
+      // Missing, opaque, or malformed Origin.
+      ["http://scim.acme.com/panel", null],
+      ["http://scim.acme.com/panel", "null"],
+      ["http://scim.acme.com/panel", "not a url"],
+    ];
+    for (const [url, origin] of untouched) {
+      const req = post(url, origin);
+      expect(withOriginScheme(req)).toBe(req);
+    }
+    for (const method of ["GET", "HEAD", "OPTIONS"]) {
+      const get = new Request("http://scim.acme.com/panel", {
+        method,
+        headers: { Origin: PANEL_ORIGIN },
+      });
+      expect(withOriginScheme(get)).toBe(get);
+    }
   });
 });
