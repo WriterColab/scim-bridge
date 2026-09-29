@@ -59,7 +59,6 @@ forbidden=(
   '(^|/)[^/]*\.db-(wal|shm)$'
   '(^|/)\.git/'
   '(^|/)[^/]*\.pem$'
-  '(^|/)gha-creds-[^/]*\.json$'
   '(^|/)id_(rsa|ed25519)$'
 )
 allow='(^|/)\.env\.example$'

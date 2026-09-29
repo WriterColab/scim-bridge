@@ -1,27 +1,26 @@
 # Publishing a Writer image
 
-In GitHub Actions, run **Publish image** on **main** with:
+In GitHub Actions, run **Publish image** on **main** and select `dev` or `release`.
 
-- **version**: a new version such as `0.4.3`, without a suffix.
-- **suffix**: `dev` or `release`.
+The image version is always the checked-out WorkOS `package.json` version plus
+one patch: upstream `0.4.2` produces `0.4.3-dev` or `0.4.3-release`. The package
+version itself is unchanged. Sync upstream changes into the fork before publishing.
 
-The workflow runs all application checks, builds the upstream Dockerfile for
-`linux/amd64`, scans image layers for secrets, and runs the authentication and
-PostgreSQL/Kubernetes runtime smoke tests. It then pushes the tested image to:
+The workflow reuses the repository's CI checks, Dockerfile, image secret scan,
+and smoke test, then pushes the built `linux/amd64` image to:
 
 ```text
 us-docker.pkg.dev/writer-shared/writer/scim-bridge:<version>-<suffix>
 ```
 
-Both suffixes build from the selected main commit. Existing tags are rejected.
-The upstream package version is unchanged; the selected image version and source
-commit are recorded in OCI labels.
+Both suffixes build from the selected main commit. Repeating a run for the same
+upstream version and suffix pushes the same tag again.
 
 Authentication uses the same Google Workload Identity provider and service
 account as identity service. No personal registry credentials or additional
 repository secrets are required.
 
-Confirm the next version against the Kubernetes updater before publishing;
-`0.4.2` already exists. A new tag may trigger a rollout through the updater.
+The Kubernetes updater reacts to new versions; repushing a tag does not advance it.
+A new tag may trigger a rollout through the updater.
 For rollback, select the previous known-good image in GitOps and constrain the
 updater as needed.
