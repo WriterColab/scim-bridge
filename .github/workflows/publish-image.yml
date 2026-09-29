@@ -1,0 +1,77 @@
+name: Publish image
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Image version (e.g. 0.4.3, without a suffix)"
+        required: true
+        type: string
+      suffix:
+        description: Image suffix
+        required: true
+        type: choice
+        default: dev
+        options:
+          - dev
+          - release
+
+permissions:
+  contents: read
+
+concurrency:
+  group: writer-scim-bridge-publish
+  cancel-in-progress: false
+
+env:
+  IMAGE: us-docker.pkg.dev/writer-shared/writer/scim-bridge
+
+jobs:
+  checks:
+    if: github.repository == 'WriterColab/scim-bridge' && github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/ci.yml
+    with:
+      skip-image: true
+
+  publish:
+    needs: checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Prepare image tag
+        id: tag
+        env:
+          VERSION: ${{ inputs.version }}
+          SUFFIX: ${{ inputs.suffix }}
+        run: |
+          if [[ ! "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "Version must be X.Y.Z without a suffix or leading zeros" >&2
+            exit 1
+          fi
+          if [[ "$SUFFIX" != dev && "$SUFFIX" != release ]]; then
+            echo "Suffix must be dev or release" >&2
+            exit 1
+          fi
+          echo "value=${VERSION}-${SUFFIX}" >> "$GITHUB_OUTPUT"
+      - uses: ./.github/actions/check-writer-image
+        with:
+          version: ${{ steps.tag.outputs.value }}
+      - uses: ./.github/actions/setup-gcp-docker
+      - name: Push image
+        env:
+          TAG: ${{ steps.tag.outputs.value }}
+        run: |
+          gcloud artifacts docker tags list "$IMAGE" --format='value(tag.basename())' > "$RUNNER_TEMP/image-tags"
+          if grep -Fxq "$TAG" "$RUNNER_TEMP/image-tags"; then
+            echo "$IMAGE:$TAG already exists; choose a new version" >&2
+            exit 1
+          fi
+          docker tag scim-bridge:writer "$IMAGE:$TAG"
+          docker push "$IMAGE:$TAG"
+          echo "Published: \`$IMAGE:$TAG\`" >> "$GITHUB_STEP_SUMMARY"

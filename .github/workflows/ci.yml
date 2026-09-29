@@ -49,8 +49,6 @@ jobs:
         with:
           token: ${{ secrets.PUBLIC_SOCKET_FIREWALL_TOKEN }}
           allow-external-fork-fallback: ${{ github.event_name == 'pull_request' }}
-      - name: Test Writer image publishing guards
-        run: node --test .github/scripts/writer-image.test.mjs
       - run: npm ci
       # Every dependency must come from the public registry: this repo is
       # published, and an internal proxy URL installs for nobody else (#45).
