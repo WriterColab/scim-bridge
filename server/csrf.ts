@@ -119,3 +119,33 @@ export function panelCsrfGuard(
     );
   };
 }
+
+/**
+ * Recover the HTTPS scheme of a panel mutation before handing it to React Router.
+ *
+ * Behind a TLS terminator the Node server sees `http://host/...` while the
+ * browser sends `Origin: https://host`. React Router >= 8.3.1 compares the full
+ * origin (scheme included) on every action and answers 400 "Bad Request" on a
+ * mismatch, so every panel form and fetcher breaks. When the Origin is exactly
+ * this request's origin upgraded to HTTPS, adopt it. Nothing else is rewritten:
+ * never a downgrade, a different host, or a different port, so React Router's
+ * own cross-origin check still applies to those. Runs after `panelCsrfGuard`.
+ */
+export function withOriginScheme(request: Request): Request {
+  if (!isMutatingMethod(request.method)) return request;
+  const origin = request.headers.get("Origin");
+  if (!origin) return request;
+  let originUrl: URL;
+  try {
+    originUrl = new URL(origin);
+  } catch {
+    return request;
+  }
+  const url = new URL(request.url);
+  if (url.protocol !== "http:" || originUrl.protocol !== "https:") return request;
+  // Compare after the upgrade so a forwarded `Host: host:443` normalizes to the
+  // browser's port-less `https://host`.
+  url.protocol = "https:";
+  if (url.origin !== originUrl.origin) return request;
+  return new Request(url, request);
+}
