@@ -204,6 +204,13 @@ describe("workos-primary DELETE id spaces", () => {
 
   it("keeps a standing gap row when the path only decodes to its resource id", async () => {
     const directory = await seedDirectory(env.DB, { mode: "workos-primary" });
+    await upsertMapping(env.DB, {
+      directory_id: directory.id,
+      resource_type: "Users",
+      native_id: "nat_victim",
+      workos_id: "nat_victim",
+      strategy: "migrated-id",
+    });
 
     // A real, standing gap: an earlier DELETE committed in WorkOS and never
     // landed in the native app, so the account is still live in the customer app.
@@ -251,6 +258,13 @@ describe("workos-primary DELETE id spaces", () => {
     // only have come from native decoding it, so it names the resource and its
     // row must still clear — otherwise the gate reports a gap that is closed.
     const directory = await seedDirectory(env.DB, { mode: "workos-primary" });
+    await upsertMapping(env.DB, {
+      directory_id: directory.id,
+      resource_type: "Users",
+      native_id: "nat_victim",
+      workos_id: "nat_victim",
+      strategy: "migrated-id",
+    });
     await recordNativeWriteFailure(env.DB, {
       directory_id: directory.id,
       resource_type: "Users",
@@ -280,6 +294,13 @@ describe("workos-primary DELETE id spaces", () => {
     // live. Reading that 404 as convergence is the whole bug, so the only
     // spelling that can carry the inference is the byte-identical one.
     const directory = await seedDirectory(env.DB, { mode: "workos-primary" });
+    await upsertMapping(env.DB, {
+      directory_id: directory.id,
+      resource_type: "Users",
+      native_id: "ada@example.com",
+      workos_id: "ada@example.com",
+      strategy: "migrated-id",
+    });
     await recordNativeWriteFailure(env.DB, {
       directory_id: directory.id,
       resource_type: "Users",
@@ -316,6 +337,13 @@ describe("workos-primary DELETE id spaces", () => {
     // come from native resolving those bytes to the resource — so the canonical
     // row clears even though the same spelling could not carry a 404.
     const directory = await seedDirectory(env.DB, { mode: "workos-primary" });
+    await upsertMapping(env.DB, {
+      directory_id: directory.id,
+      resource_type: "Users",
+      native_id: "ada@example.com",
+      workos_id: "ada@example.com",
+      strategy: "migrated-id",
+    });
     await recordNativeWriteFailure(env.DB, {
       directory_id: directory.id,
       resource_type: "Users",

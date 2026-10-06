@@ -75,21 +75,21 @@ describe("reconcile sweep and un-repairable divergence rows", () => {
   it("preserves a DELETE deprovisioning gap that a PUT-only reconcile cannot repair", async () => {
     const directory = await seedDwelling();
 
-    // 1. IdP deprovisions native-1 while native is down: WorkOS leg commits (204),
-    //    native leg fails (500). Driven through the real proxy HTTP handler.
+    // 1. IdP deprovisions native-1: WorkOS commits (204), but native definitively
+    //    rejects the delete (400). That releases the claim while leaving a gap.
     fake.route("workos", "DELETE", "/Users/workos-1", new Response(null, { status: 204 }));
-    fake.route("native", "DELETE", "/Users/native-1", scimJson(500, { detail: "outage" }));
+    fake.route("native", "DELETE", "/Users/native-1", scimJson(400, { detail: "delete refused" }));
     const del = await proxyWorker.fetch(
       proxyRequest(directory, "DELETE", "/scim/v2/Users/native-1"),
       env,
       createCtx(),
     );
-    expect(del.status).toBe(502);
+    expect(del.status).toBe(400);
     const afterDelete = await listNativeWriteFailures(env.DB, directory.id);
     expect(afterDelete).toHaveLength(1);
     expect(afterDelete[0]).toMatchObject({ resource_key: "native-1", method: "DELETE" });
 
-    // 2. Native recovers; operator clicks "Reconcile from WorkOS". The deprovisioned
+    // 2. Operator clicks "Reconcile from WorkOS". The deprovisioned
     //    user is absent from the WorkOS snapshot; only the survivor is replayed.
     fake.route("workos", "GET", "/Users", listPage([{ id: "wos_2", userName: "two@x.test" }]));
     fake.route("workos", "GET", "/Groups", listPage([]));

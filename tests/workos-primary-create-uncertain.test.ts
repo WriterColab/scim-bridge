@@ -100,7 +100,7 @@ describe("workos-primary creates with an unresolved upstream outcome", () => {
     { kind: "Users", nativeStatus: 503 },
     { kind: "Groups", nativeStatus: 503 },
   ])(
-    "retains the $kind claim when native returns $nativeStatus after WorkOS creates the row",
+    "retains the $kind claim when native returns $nativeStatus and the new WorkOS row remains unresolved",
     async ({ kind, nativeStatus }) => {
       const directory = await seedDirectory(env.DB, { mode: "workos-primary" });
       const attribute = kind === "Users" ? "userName" : "displayName";
@@ -120,6 +120,12 @@ describe("workos-primary creates with an unresolved upstream outcome", () => {
         workosRow = { ...(call.json() as Record<string, unknown>), id: "shared-id" };
         return scimJson(201, workosRow);
       });
+      fake.route(
+        "workos",
+        "DELETE",
+        `/${kind}/shared-id`,
+        scimJson(503, { detail: "compensation failed" }),
+      );
       const create = (name: string) =>
         proxyWorker.fetch(
           proxyRequest(directory, "POST", `/scim/v2/${kind}`, {
@@ -144,7 +150,7 @@ describe("workos-primary creates with an unresolved upstream outcome", () => {
       expect(workosRow).toMatchObject({ id: "shared-id", [attribute]: "first" });
       expect(await getMapping(env.DB, directory.id, kind, "native-second")).toBeNull();
       expect(fake.callsTo("native")).toHaveLength(1);
-      expect(fake.callsTo("workos")).toHaveLength(2);
+      expect(fake.callsTo("workos")).toHaveLength(nativeStatus === 400 ? 3 : 2);
       expect(await listNativeWriteFailures(env.DB, directory.id)).toMatchObject([
         { resource_type: kind, resource_key: "shared-id", native_status: nativeStatus },
       ]);

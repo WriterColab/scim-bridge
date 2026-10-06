@@ -261,6 +261,13 @@ describe("reconcile replay of an unmapped WorkOS row in a shared namespace", () 
     const summary = await runReconcileFromWorkos(env.DB, await reload(env.DB, only));
 
     expect(summary.users).toMatchObject({ total: 1, mirrored: 1, failed: 0 });
-    expect(native.users.get("own-1")).toMatchObject({ userName: "a@orga.example" });
+    const mapping = await env.DB.prepare(
+      "SELECT native_id FROM id_mappings WHERE directory_id = ? AND workos_id = ?",
+    )
+      .bind(only.id, "own-1")
+      .first<{ native_id: string }>();
+    expect(mapping?.native_id).not.toBe("own-1");
+    expect(native.users.get(mapping!.native_id)).toMatchObject({ userName: "a@orga.example" });
+    expect(fake.callsTo("native").map((call) => call.method)).toEqual(["GET", "POST"]);
   });
 });

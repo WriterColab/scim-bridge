@@ -116,7 +116,7 @@ describe("workos-primary create claims", () => {
         env,
         createCtx(),
       );
-    fake.route("native", "POST", "/Users", scimJson(503, { detail: "temporarily unavailable" }), {
+    fake.route("native", "POST", "/Users", scimJson(400, { detail: "invalid create" }), {
       once: true,
     });
     fake.route(
@@ -125,13 +125,9 @@ describe("workos-primary create claims", () => {
       "/Users",
       scimJson(201, { id: "native-1", userName: "ada@example.com" }),
     );
-    fake.route(
-      "workos",
-      "PUT",
-      "/Users/idp-1",
-      scimJson(503, { detail: "temporarily unavailable" }),
-      { once: true },
-    );
+    fake.route("workos", "PUT", "/Users/idp-1", scimJson(400, { detail: "invalid create" }), {
+      once: true,
+    });
     fake.route(
       "workos",
       "PUT",
@@ -139,7 +135,7 @@ describe("workos-primary create claims", () => {
       scimJson(200, { id: "idp-1", userName: "ada@example.com" }),
     );
 
-    expect((await create()).status).toBe(502);
+    expect((await create()).status).toBe(400);
     expect(await readClaim(directory.id)).toBeNull();
     expect(await listNativeWriteFailures(env.DB, directory.id)).toEqual([]);
 

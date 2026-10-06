@@ -1,7 +1,10 @@
-import { getConfig } from "../shared/db";
+import { getConfig, getMapping, withDatastoreRetry } from "../shared/db";
 import { clientTokenFor } from "../shared/client-tokens";
+import { eventName } from "../shared/event-mapping";
+import { isRecord } from "../shared/scim";
+import { bindEventLink } from "../shared/event-links";
 import type { Datastore } from "../shared/datastore";
-import type { Directory } from "../shared/types";
+import type { Directory, ResourceType } from "../shared/types";
 import type { DirectoryStatus } from "../proxy/status";
 
 /** How long a fetched status stays fresh before revalidating. Matches the
@@ -126,6 +129,114 @@ export async function fetchDirectoryStatus(
     failedUntil.set(directory.id, now + TTL_MS);
     return staleAnswer;
   }
+}
+
+/** Learn a verified pair without giving a standalone listener WorkOS secrets. */
+export async function fetchEventNativeId(
+  db: Datastore,
+  directory: Directory,
+  kind: ResourceType,
+  resource: Record<string, unknown>,
+  existingOnly = false,
+): Promise<string | null> {
+  const base = (
+    (await getConfig(db, "proxy.loopback_url")) ?? (await getConfig(db, "proxy.public_url"))
+  )?.replace(/\/+$/, "");
+  const token = await clientTokenFor(db, directory.id);
+  if (!base || !token) throw new Error("Event has no authenticated bridge mapping resolver");
+  const name = eventName(kind, resource);
+  const idpId = resource.idp_id;
+  if (!existingOnly && (!name || typeof idpId !== "string" || !idpId))
+    throw new Error("Event has no usable SCIM identity attributes");
+  const query = new URLSearchParams({
+    dsync_id: String(resource.id ?? ""),
+  });
+  if (typeof idpId === "string" && idpId) query.set("idp_id", idpId);
+  if (name) query.set(kind === "Users" ? "userName" : "displayName", name);
+  const raw = isRecord(resource.raw_attributes) ? resource.raw_attributes : {};
+  if (existingOnly) query.set("existing_only", "1");
+  if (typeof raw.externalId === "string" && raw.externalId) query.set("externalId", raw.externalId);
+  const response = await fetch(
+    `${base}/status/directories/${encodeURIComponent(directory.id)}/event-mapping/${kind}?${query}`,
+    {
+      headers: { Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    },
+  );
+  if (!response.ok) throw new Error(`Bridge event mapping resolver returned ${response.status}`);
+  const mapping: unknown = await response.json();
+  if (
+    !isRecord(mapping) ||
+    mapping.workos_directory_id !== directory.workos_directory_id ||
+    mapping.resource_type !== kind ||
+    mapping.dsync_id !== resource.id ||
+    typeof mapping.workos_scim_id !== "string" ||
+    !mapping.workos_scim_id ||
+    typeof mapping.native_id !== "string" ||
+    !mapping.native_id ||
+    (mapping.strategy !== undefined &&
+      mapping.strategy !== "migrated-id" &&
+      mapping.strategy !== "fallback-post")
+  )
+    throw new Error("Bridge returned an invalid event mapping");
+  // The remote bridge id differs from this listener's local directory id. Never
+  // overwrite an existing local association when learning the verified pair.
+  const readOwners = () =>
+    withDatastoreRetry(() =>
+      db
+        .prepare(
+          "SELECT native_id FROM id_mappings WHERE directory_id = ? AND resource_type = ? AND workos_id = ? LIMIT 2",
+        )
+        .bind(directory.id, kind, mapping.workos_scim_id)
+        .all<{ native_id: string }>(),
+    );
+  const previous = await getMapping(db, directory.id, kind, mapping.native_id);
+  const previousOwners = (await readOwners()).results;
+  if (
+    (previous && previous.workos_id !== mapping.workos_scim_id) ||
+    previousOwners.some((owner) => owner.native_id !== mapping.native_id)
+  )
+    throw new Error("Verified bridge identity conflicts with an existing local mapping");
+  await bindEventLink(db, {
+    directory_id: directory.id,
+    resource_type: kind,
+    dsync_id: String(resource.id),
+    native_id: mapping.native_id,
+    workos_id: mapping.workos_scim_id,
+  });
+  if (!mapping.strategy) return mapping.native_id;
+  await withDatastoreRetry(() =>
+    db
+      .prepare(
+        "INSERT INTO id_mappings (directory_id, resource_type, native_id, workos_id, strategy) " +
+          "SELECT ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM id_mappings " +
+          "WHERE directory_id = ? AND resource_type = ? AND ((native_id = ? AND workos_id != ?) " +
+          "OR (workos_id = ? AND native_id != ?))) ON CONFLICT DO NOTHING",
+      )
+      .bind(
+        directory.id,
+        kind,
+        mapping.native_id,
+        mapping.workos_scim_id,
+        mapping.strategy,
+        directory.id,
+        kind,
+        mapping.native_id,
+        mapping.workos_scim_id,
+        mapping.workos_scim_id,
+        mapping.native_id,
+      )
+      .run(),
+  );
+  const byNative = await getMapping(db, directory.id, kind, mapping.native_id);
+  const owners = (await readOwners()).results;
+  if (
+    byNative?.workos_id !== mapping.workos_scim_id ||
+    owners.length !== 1 ||
+    owners[0].native_id !== mapping.native_id
+  )
+    throw new Error("Verified bridge identity conflicts with an existing local mapping");
+  return mapping.native_id;
 }
 
 /** Whether a cached entry answers this read: inside the TTL, and — when the

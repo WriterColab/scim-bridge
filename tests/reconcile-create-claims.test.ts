@@ -89,7 +89,7 @@ describe("reconcile and workos-primary create claims", () => {
   );
 
   it.each<ResourceType>(["Users", "Groups"])(
-    "blocks a %s create throughout reconciliation and reserves a replayed shared id",
+    "blocks a %s create throughout reconciliation and reserves the native-owned replay ID",
     async (kind) => {
       const directory = await seedDirectory(env.DB, { mode: "workos-primary" });
       const attribute = kind === "Users" ? "userName" : "displayName";
@@ -109,9 +109,8 @@ describe("reconcile and workos-primary create claims", () => {
         return page(kind === "Users" ? [resource] : []);
       });
       fake.route("workos", "GET", "/Groups", page(kind === "Groups" ? [resource] : []));
-      fake.route("native", "PUT", `/${kind}/shared-id`, scimJson(201, resource));
       fake.route("native", "POST", `/${kind}`, (call) =>
-        scimJson(201, { ...(call.json() as Record<string, unknown>), id: "native-second" }),
+        scimJson(201, { ...(call.json() as Record<string, unknown>), id: "native-replayed" }),
       );
       fake.route("native", "GET", `/${kind}`, page([]));
       fake.route("workos", "PUT", `/${kind}/shared-id`, (call) =>
@@ -127,18 +126,18 @@ describe("reconcile and workos-primary create claims", () => {
         mirrored: 1,
         failed: 0,
       });
-      expect(fake.callsTo("native").map((call) => call.method)).toEqual(["PUT"]);
+      expect(fake.callsTo("native").map((call) => call.method)).toEqual(["GET", "POST"]);
       expect(fake.callsTo("workos").every((call) => call.method === "GET")).toBe(true);
-      expect(await getMapping(env.DB, directory.id, kind, "shared-id")).toMatchObject({
+      expect(await getMapping(env.DB, directory.id, kind, "native-replayed")).toMatchObject({
         workos_id: "shared-id",
-        strategy: "migrated-id",
+        strategy: "fallback-post",
       });
       expect(await claims(directory.id)).toEqual([]);
 
       // Releasing a completed reconcile must not expose its new native row to
       // a later create under a different unique attribute.
       expect((await create()).status).toBe(409);
-      expect(fake.callsTo("native").some((call) => call.method === "POST")).toBe(false);
+      expect(fake.callsTo("native").filter((call) => call.method === "POST")).toHaveLength(1);
       expect(fake.callsTo("workos").some((call) => call.method !== "GET")).toBe(false);
     },
   );
@@ -162,6 +161,13 @@ describe("reconcile and workos-primary create claims", () => {
 
   it("retains both claims after an uncertain native replay and blocks subsequent creates", async () => {
     const directory = await seedDirectory(env.DB, { mode: "workos-primary" });
+    await upsertMapping(env.DB, {
+      directory_id: directory.id,
+      resource_type: "Users",
+      native_id: "shared-id",
+      workos_id: "shared-id",
+      strategy: "migrated-id",
+    });
     fake.route("workos", "GET", "/Users", page([{ id: "shared-id", userName: "first" }]));
     fake.route("workos", "GET", "/Groups", page([]));
     fake.route("native", "PUT", "/Users/shared-id", () => {
@@ -190,7 +196,8 @@ describe("reconcile and workos-primary create claims", () => {
   it("retains both claims when a replay commits but its new mapping cannot persist", async () => {
     const directory = await seedDirectory(env.DB, { mode: "workos-primary" });
     fake.route("workos", "GET", "/Users", page([{ id: "shared-id", userName: "first" }]));
-    fake.route("native", "PUT", "/Users/shared-id", scimJson(201, { id: "shared-id" }));
+    fake.route("native", "GET", "/Users", page([]));
+    fake.route("native", "POST", "/Users", scimJson(201, { id: "native-replayed" }));
     const prepare = env.DB.prepare.bind(env.DB);
     vi.spyOn(env.DB, "prepare").mockImplementation((sql) => {
       if (sql.startsWith("INSERT INTO id_mappings")) throw new Error("mapping persistence failed");
@@ -209,6 +216,13 @@ describe("reconcile and workos-primary create claims", () => {
     { label: "no id", body: { userName: "first" } },
   ])("retains claims when a successful replay returns $label", async ({ body }) => {
     const directory = await seedDirectory(env.DB, { mode: "workos-primary" });
+    await upsertMapping(env.DB, {
+      directory_id: directory.id,
+      resource_type: "Users",
+      native_id: "shared-id",
+      workos_id: "shared-id",
+      strategy: "migrated-id",
+    });
     fake.route("workos", "GET", "/Users", page([{ id: "shared-id", userName: "first" }]));
     fake.route("workos", "GET", "/Groups", page([]));
     fake.route("native", "PUT", "/Users/shared-id", scimJson(201, body));
@@ -216,7 +230,9 @@ describe("reconcile and workos-primary create claims", () => {
     const summary = await runReconcileFromWorkos(env.DB, directory);
 
     expect(summary.users).toEqual({ total: 1, mirrored: 0, failed: 1 });
-    expect(await getMapping(env.DB, directory.id, "Users", "shared-id")).toBeNull();
+    expect(await getMapping(env.DB, directory.id, "Users", "shared-id")).toMatchObject({
+      workos_id: "shared-id",
+    });
     expect(await getMapping(env.DB, directory.id, "Users", "native-unexpected")).toBeNull();
     expect(await claims(directory.id)).toHaveLength(2);
   });
@@ -231,7 +247,12 @@ describe("reconcile and workos-primary create claims", () => {
     );
     fake.route("workos", "GET", "/Groups", page([]));
     fake.route("native", "PUT", "/Users/shared-id", scimJson(409, { detail: "userName exists" }));
-    fake.route("native", "GET", "/Users", page([{ id: "native-drift", userName: "first" }]));
+    fake.route(
+      "native",
+      "GET",
+      "/Users",
+      page([{ id: "native-drift", userName: "first", externalId: "native-drift" }]),
+    );
     fake.route("native", "PUT", "/Users/native-drift", () => {
       throw new Error("drift repair response lost");
     });
@@ -255,7 +276,12 @@ describe("reconcile and workos-primary create claims", () => {
       );
       fake.route("workos", "GET", "/Groups", page([]));
       fake.route("native", "PUT", "/Users/shared-id", scimJson(409, { detail: "userName exists" }));
-      fake.route("native", "GET", "/Users", page([{ id: "native-drift", userName: "first" }]));
+      fake.route(
+        "native",
+        "GET",
+        "/Users",
+        page([{ id: "native-drift", userName: "first", externalId: "native-drift" }]),
+      );
       fake.route("native", "PUT", "/Users/native-drift", scimJson(status, { detail: "rejected" }));
 
       const summary = await runReconcileFromWorkos(env.DB, directory);
@@ -277,7 +303,7 @@ describe("reconcile and workos-primary create claims", () => {
     },
   );
 
-  it("refuses drift onto a second native id when the WorkOS row already has a mapping", async () => {
+  it("keeps a mapped identity after a definite conflict without blocking creates", async () => {
     const directory = await seedDirectory(env.DB, { mode: "workos-primary" });
     await upsertMapping(env.DB, {
       directory_id: directory.id,
@@ -312,7 +338,11 @@ describe("reconcile and workos-primary create claims", () => {
       workos_id: "workos-1",
     });
     expect(await getMapping(env.DB, directory.id, "Users", "native-new")).toBeNull();
-    expect(await claims(directory.id)).toHaveLength(2);
+    // A mapped PUT's definite conflict changes no identity and must not block
+    // unrelated creates. The existing mapping remains available for repair.
+    expect(await claims(directory.id)).toEqual([]);
+    expect(await claimWorkosPrimaryCreate(env.DB, directory.id, "Users", "next-user")).toBe(true);
+    expect(await claimWorkosPrimaryCreate(env.DB, directory.id, "Groups", "next-group")).toBe(true);
   });
 
   it("releases after read-only snapshot failure when no native replay began", async () => {

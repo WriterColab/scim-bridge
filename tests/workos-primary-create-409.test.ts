@@ -158,19 +158,14 @@ describe("workos-primary create on a native 409 in a shared namespace", () => {
       .first();
     expect(mapping).toBeNull();
 
-    // Nor may a write addressed at the id directly earn one. The native leg of a
-    // `workos-primary` write is the IdP's request forwarded verbatim, so a flat
-    // native app that accepts any id under any of its tokens still applies it —
-    // that is the pass-through boundary mirrorDualWrite already documents, and it
-    // needs an id this directory is not supposed to know. What must not happen is
-    // the durable claim: no mapping, and the WorkOS leg refuses, so a later
-    // "Reconcile from WorkOS" cannot be steered onto the victim's row.
+    // A direct write without this directory's native mapping is refused before
+    // either leg runs in a shared namespace, and cannot earn a durable claim.
     const put = await send(env, attacker, "PUT", "/scim/v2/Users/vic-1", {
       userName: "victim.user@orgb.example",
       active: false,
       title: "attacker-owned",
     });
-    expect(put.status).toBe(404);
+    expect(put.status).toBe(409);
     expect(
       await env.DB.prepare("SELECT native_id FROM id_mappings WHERE directory_id = ?")
         .bind(attacker.id)

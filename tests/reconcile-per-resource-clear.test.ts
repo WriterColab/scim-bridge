@@ -1,6 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import proxyWorker from "../workers/proxy/index";
-import { listNativeWriteFailures, upsertMapping } from "../workers/shared/db";
+import {
+  listNativeWriteFailures,
+  recordNativeWriteFailure,
+  upsertMapping,
+} from "../workers/shared/db";
 import { runReconcileFromWorkos } from "../workers/shared/backfill";
 import type { PocEnv } from "../workers/shared/types";
 import {
@@ -29,8 +33,9 @@ import {
  * landed after the replay touched the key (and was erased by the sweep); here it
  * lands before, and is erased by the per-resource clear.
  *
- * Both divergences are recorded by driving the real proxy HTTP handler with the
- * IdP's proxy token — the interface the IdP uses — not by calling the recorder.
+ * The PUT divergence uses the real proxy handler. DELETE now shares the reconcile
+ * claim, so its test checks that live DELETE is blocked and directly records a
+ * late DELETE gap to retain coverage of the ledger's independent method guard.
  */
 function listPage(resources: Record<string, unknown>[], totalResults = resources.length) {
   return scimJson(200, {
@@ -115,28 +120,33 @@ describe("reconcile's per-resource clear and a post-watermark divergence", () =>
 
   it("keeps a mid-reconcile DELETE gap a PUT replay can never close", async () => {
     const directory = await seedDwelling();
-    let nativeAcceptsWrites = true;
     let midReconcile: Awaited<ReturnType<typeof listNativeWriteFailures>> = [];
 
     fake.route("workos", "DELETE", "/Users/wos_2", () => new Response(null, { status: 204 }));
-    fake.route("native", "DELETE", /^\/Users\//, () =>
-      nativeAcceptsWrites ? new Response(null, { status: 204 }) : scimJson(500, { detail: "blip" }),
-    );
+    fake.route("native", "DELETE", /^\/Users\//, new Response(null, { status: 204 }));
     fake.route("native", "PUT", /^\/Users\//, (call) => scimJson(200, call.json()));
 
-    // Mid-snapshot the IdP deprovisions u2: WorkOS deletes the user, the native
-    // leg blips, so a DELETE gap is recorded stamp-less. The snapshot page the
-    // reconcile receives was taken before the deletion and still lists the user.
+    // A live DELETE cannot race this snapshot or change either upstream. Model a
+    // late ledger entry independently so replay must still preserve DELETE gaps.
     fake.route("workos", "GET", "/Users", async () => {
-      nativeAcceptsWrites = false;
+      const callsBeforeDelete = fake.calls.length;
       const deprovision = await proxyWorker.fetch(
         proxyRequest(directory, "DELETE", "/scim/v2/Users/u2"),
         env,
         createCtx(),
       );
-      expect(deprovision.status).toBe(502);
+      expect(deprovision.status).toBe(503);
+      expect(fake.calls).toHaveLength(callsBeforeDelete);
+      expect(await listNativeWriteFailures(env.DB, directory.id)).toEqual([]);
+      await recordNativeWriteFailure(env.DB, {
+        directory_id: directory.id,
+        resource_type: "Users",
+        resource_key: "u2",
+        method: "DELETE",
+        native_status: 500,
+        detail: "Previously completed WorkOS delete; native outcome unresolved",
+      });
       midReconcile = await listNativeWriteFailures(env.DB, directory.id);
-      nativeAcceptsWrites = true;
       return listPage([{ id: "wos_2", userName: "two@x.test", active: true }]);
     });
     fake.route("workos", "GET", "/Groups", listPage([]));

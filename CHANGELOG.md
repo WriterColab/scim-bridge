@@ -13,6 +13,46 @@ Container images for each version:
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-10-06
+
+### Fixed
+
+- Recover a refused `workos-primary` create by removing only the WorkOS row
+  freshly created by that request, then releasing its claim after confirmed
+  cleanup. Ambiguous writes and unsuccessful cleanup retain their claims.
+- Reconcile unmapped WorkOS resources through verified native identity lookup
+  or native `POST`, adopting the native service's returned id. Native writes
+  and primary reads no longer treat an unconfirmed WorkOS id as a native id.
+  Mapped WorkOS resource recreation shares the create/reconcile claim and
+  preserves newer mappings when an older update completes late. Primary deletes
+  hold the same claim through both delete legs and mapping cleanup.
+  Reconciliation refuses incomplete native absence checks and releases claims
+  after a definite rejection of an already mapped update. Adopting an unmapped
+  name match requires matching nonempty external ids and respects retained event
+  identity reservations, preventing reused names from inheriting old access.
+- Resolve Directory Sync membership events through confirmed SCIM mappings,
+  preserving migrated native ids even when event resource ids differ. Provide
+  directory-token-scoped mapping endpoints and persist verified Directory Sync
+  identity links so delayed deletions cannot target a row that reused a name.
+  Resolve both membership endpoints before provisioning, and return retryable
+  webhook failures for unresolved identities.
+- Reject ambiguous legacy SCIM mappings in the direct consumer lookup, and
+  in the IDs a request translates, preserving unrelated directory traffic.
+  Release unused create, delete, mapped recovery, and reconciliation claims
+  after read failures before their writes begin. Forward the optional WorkOS API key through the
+  Cloudflare container adapter.
+
+### Upgrading
+
+- Set `WORKOS_API_KEY` on the bridge to verify previously unknown Directory Sync
+  identities. Customer listeners use the directory-scoped proxy token. Preload
+  verified identity links before cutover; unresolved identities remain retryable
+  and do not provision or delete an unrelated native row.
+- Inspect and recover claims and invalid mappings retained by earlier versions
+  using the [runbook](docs/runbook.md#recovering-retained-create-claims-and-invalid-legacy-mappings).
+  Claims do not expire, and a valid mapped identity is never rebound on a native
+  `404`.
+
 ## [0.4.2] - 2026-09-24
 
 ### Fixed
@@ -225,7 +265,8 @@ hardens the control panel — a minor bump on several fronts.
 - First release: the SCIM migration proxy (passthrough → dual-write → backfill →
   cut over, reversible until commit), the control panel, and a Docker image.
 
-[unreleased]: https://github.com/workos/scim-bridge/compare/v0.4.2...HEAD
+[unreleased]: https://github.com/workos/scim-bridge/compare/v0.4.3...HEAD
+[0.4.3]: https://github.com/workos/scim-bridge/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/workos/scim-bridge/compare/v0.4.1...v0.4.2
 [0.2.2]: https://github.com/workos/scim-bridge/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/workos/scim-bridge/compare/v0.2.0...v0.2.1

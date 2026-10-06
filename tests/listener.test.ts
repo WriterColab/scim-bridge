@@ -1296,7 +1296,7 @@ describe("dsync listener", () => {
   });
 
   describe("handler errors", () => {
-    it("acknowledges a handler error without an event id so a redelivery can repair it", async () => {
+    it("returns a retryable handler error without an event id so a redelivery can repair it", async () => {
       const { env } = await seedListenerEnv();
       // Hide the users table so the apply throws a non-transient storage error.
       await env.DB.prepare("ALTER TABLE native_users RENAME TO native_users_hidden").run();
@@ -1304,8 +1304,9 @@ describe("dsync listener", () => {
 
       const res = await deliver(env, event);
 
-      expect(res.status).toBe(200);
-      expect(await res.json()).toEqual({ received: true });
+      expect(res.status).toBe(503);
+      expect(res.headers.get("Retry-After")).toBe("5");
+      expect(await res.json()).toMatchObject({ received: false });
       const failed = await lastEvent(env.DB);
       expect(failed.action).toBe("ignored");
       expect(failed.detail).toMatch(/^handler error \(event event_err\): /);

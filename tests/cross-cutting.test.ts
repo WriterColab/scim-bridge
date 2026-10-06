@@ -268,7 +268,7 @@ describe("cross-cutting seams", () => {
       expect(listing.Resources[0].members).toEqual([{ value: "u1" }, { value: "u2" }]);
 
       // Rollback reconcile: the WorkOS snapshot (minted ids and all) is pushed
-      // back to native under the native ids, with the migrated-id header.
+      // back to native under the native ids, without requiring migrated-id support.
       fake.route(
         "workos",
         "GET",
@@ -290,7 +290,7 @@ describe("cross-cutting seams", () => {
         "/Users/u2",
       ]);
       const u2Put = nativePuts.find((c) => c.path === "/Users/u2");
-      expect(u2Put?.headers.get(MIGRATED_ID_HEADER)).toBe("u2");
+      expect(u2Put?.headers.get(MIGRATED_ID_HEADER)).toBeNull();
       expect((u2Put!.json() as Record<string, unknown>).id).toBe("u2");
       const groupPut = nativePuts.find((c) => c.path === "/Groups/g1");
       expect((groupPut!.json() as { members: { value: string }[] }).members).toEqual([

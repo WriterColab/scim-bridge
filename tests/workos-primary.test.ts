@@ -283,11 +283,10 @@ describe("workos-primary", () => {
       );
     }
 
-    it("converges on a retry after WorkOS deleted and native refused", async () => {
-      // The WorkOS delete prunes the id mapping, so the retry addresses WorkOS by
-      // the path id and is answered 404. That is a delete that converged, not one
-      // that failed: native finishes its half, the IdP hears native's answer, and
-      // the divergence row goes rather than outliving the resource.
+    it("converges after verified recovery of an uncertain native DELETE", async () => {
+      // An uncertain delete keeps its claim and mapping so a late native delete
+      // cannot remove a replacement. Recovery verifies native and outstanding
+      // requests before releasing the inspected claim for a retry.
       const directory = await seedMapped();
       fake.route("workos", "DELETE", "/Users/workos-1", new Response(null, { status: 204 }));
       fake.route("native", "DELETE", "/Users/native-1", scimJson(500, { detail: "boom" }), {
@@ -297,6 +296,24 @@ describe("workos-primary", () => {
       const first = await del(directory);
       expect(first.status).toBe(502);
       expect((await failures(directory.id))[0]).toMatchObject({ method: "DELETE" });
+
+      const beforeRetry = fake.calls.length;
+      expect((await del(directory)).status).toBe(503);
+      expect(fake.calls).toHaveLength(beforeRetry);
+      const retained = await env.DB.prepare(
+        "SELECT token FROM workos_primary_create_claims WHERE directory_id = ? AND resource_type = 'Users'",
+      )
+        .bind(directory.id)
+        .first<{ token: string }>();
+      expect(retained?.token).toEqual(expect.any(String));
+      // The fixture's first DELETE handler has settled without applying a write.
+      // Confirm its native row before the operator releases that exact claim.
+      fake.route("native", "GET", "/Users/native-1", scimJson(200, { id: "native-1" }));
+      const verified = await fetch(`${directory.native_url}/Users/native-1`, {
+        headers: { Authorization: `Bearer ${directory.native_token}` },
+      });
+      expect(await verified.json()).toMatchObject({ id: "native-1" });
+      await releaseWorkosPrimaryCreate(env.DB, directory.id, "Users", retained!.token);
 
       fake.route("native", "DELETE", "/Users/native-1", new Response(null, { status: 204 }));
       fake.route("workos", "DELETE", "/Users/native-1", scimJson(404, { detail: "gone" }));

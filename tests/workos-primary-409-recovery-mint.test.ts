@@ -159,20 +159,18 @@ describe("workos-primary: 409-recovery mint", () => {
     const victimMapping = await getMapping(env.DB, directory.id, "Users", "nat_9f3c");
     expect(victimMapping).toMatchObject({ workos_id: "wos_1", strategy: "fallback-post" });
 
-    // A PUT to an id of the caller's choosing carrying the victim's userName: the
-    // WorkOS leg's migrated-id PUT 404s, its POST 409s on the name, and the
-    // recovery filter resolves the victim's row (wos_1).
+    // An unmapped PUT must fail before a WorkOS create/recovery dance could
+    // resolve the victim's userName and mint a second mapping onto its row.
+    const beforeMint = fake.calls.length;
     const mint = await send(env, directory, "PUT", "/scim/v2/Users/atk-x", {
       userName: "ada@example.com",
       active: true,
       title: "intern",
     });
-    // The IdP hears native's 404 for an id native never held; the WorkOS leg's
-    // refusal committed nothing, so neither leg wrote anything to keep.
-    expect(mint.status).toBe(404);
+    expect(mint.status).toBe(409);
+    expect(fake.calls.slice(beforeMint)).toEqual([]);
 
-    // The load-bearing assertions — status alone is 404 either way. On unmodified
-    // main all three go red: the second mapping is recorded, the victim's row is
+    // On unmodified main these go red: the second mapping is recorded, the victim's row is
     // overwritten to "intern", and a native_write_failure is logged for a WorkOS
     // write that (wrongly) "committed".
     expect(await getMapping(env.DB, directory.id, "Users", "atk-x")).toBeNull();
@@ -181,7 +179,8 @@ describe("workos-primary: 409-recovery mint", () => {
 
     // With no mapping to stand on, the DELETE the alias would have carried reaches
     // neither leg's row: the victim survives on both sides and stays mapped.
-    expect((await send(env, directory, "DELETE", "/scim/v2/Users/atk-x")).status).toBe(404);
+    expect((await send(env, directory, "DELETE", "/scim/v2/Users/atk-x")).status).toBe(409);
+    expect(fake.calls.slice(beforeMint)).toEqual([]);
     expect(workosUsers.has("wos_1")).toBe(true);
     expect(nativeUsers.get("nat_9f3c")).toMatchObject({ userName: "ada@example.com" });
     expect(await getMapping(env.DB, directory.id, "Users", "nat_9f3c")).toMatchObject({

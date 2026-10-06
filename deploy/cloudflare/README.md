@@ -46,6 +46,14 @@ npx wrangler secret put PANEL_AUTH_PASSWORD      # both, or the panel refuses to
 npx wrangler secret put APP_ENCRYPTION_KEY       # encrypts upstream tokens at rest
 ```
 
+For authenticated Directory Sync resource verification, configure the optional
+WorkOS API secret. The adapter forwards it to the container only when set; it also
+enables Events API polling in the `native-app` role.
+
+```sh
+npx wrangler secret put WORKOS_API_KEY --config deploy/cloudflare/wrangler.jsonc
+```
+
 Only for a deployment standing in for a customer application (`APP_ROLE=native-app`):
 
 ```sh

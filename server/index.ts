@@ -54,7 +54,7 @@ if (applied.length) console.log(`Applied ${applied.length} migration(s): ${appli
 // panel (separate module graphs) encrypt/decrypt consistently.
 store.encryptionKey = config.encryptionKey;
 if (config.encryptionKey) console.log("Per-directory token encryption: enabled");
-const env: PocEnv = { DB: store };
+const env: PocEnv = { DB: store, WORKOS_API_KEY: config.workosApiKey ?? undefined };
 // Rows written before proxy tokens were hashed at rest hold them in the clear.
 // Convert them before anything authenticates, and before the seeding below writes
 // more rows.

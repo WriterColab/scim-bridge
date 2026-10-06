@@ -122,6 +122,8 @@ export interface BackfillSummary {
 /** Bindings shared by the proxy worker, the native app worker, and the panel. */
 export interface PocEnv {
   DB: Datastore;
+  /** Used only on the bridge to verify a first Directory Sync resource binding. */
+  WORKOS_API_KEY?: string;
 }
 
 /**

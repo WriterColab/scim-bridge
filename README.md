@@ -170,6 +170,18 @@ miss. So a first-touch write runs the dance `PUT /{kind}/{id}` → `404` →
 `POST /{kind}` (both with the header), and a `POST 409` (create race) retries the
 `PUT` to resolve the winner.
 
+In `workos-primary`, an addressed `PUT`, `PATCH`, or `DELETE` requires an
+existing native-id mapping. An unknown id returns `409` without contacting
+either upstream; establish its mapping through backfill or reconciliation
+before retrying. A WorkOS-side alias that is not a native id returns `404`.
+Live writes do not acquire an unmapped identity, so they cannot race the
+serialized create/reconcile mapping repair.
+If a mapped `PUT` needs to recreate a missing WorkOS row, its `POST` recovery
+and mapping commit acquire the same claim. Ordinary mapped updates remain
+concurrent and do not rewrite an unchanged mapping.
+Primary deletes hold that claim through both upstream deletes and mapping
+cleanup, preventing a concurrent recovery from creating an orphan replacement.
+
 | Your IdP sends (→ proxy) | Proxy sends to WorkOS | How WorkOS handles it |
 | --- | --- | --- |
 | `POST /Users` (create) | `PUT /Users/{id}` + header → `404` → `POST /Users` + header | Creates the user and adopts `{id}` as its id. In dual-write, `{id}` is the id your native app minted (learned from its `201`); after cutover it is derived from the IdP `externalId`. |

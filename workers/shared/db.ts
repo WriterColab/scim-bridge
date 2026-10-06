@@ -524,14 +524,23 @@ export async function getMappingByWorkosId(
   resourceType: ResourceType,
   workosId: string,
 ): Promise<IdMapping | null> {
-  return withDatastoreRetry(() =>
+  const { results } = await withDatastoreRetry(() =>
     db
       .prepare(
-        "SELECT * FROM id_mappings WHERE directory_id = ? AND resource_type = ? AND workos_id = ?",
+        "SELECT * FROM id_mappings WHERE directory_id = ? AND resource_type = ? AND workos_id = ? LIMIT 2",
       )
       .bind(directoryId, resourceType, workosId)
-      .first<IdMapping>(),
+      .all<IdMapping>(),
   );
+  if (results.length > 1) throw new AmbiguousScimMappingError();
+  return results[0] ?? null;
+}
+
+/** Legacy databases may contain several native owners for one scoped SCIM id. */
+export class AmbiguousScimMappingError extends Error {
+  constructor() {
+    super("SCIM mapping is ambiguous");
+  }
 }
 
 /**
