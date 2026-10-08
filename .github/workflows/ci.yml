@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_call:
 
 permissions:
   contents: read
@@ -39,6 +40,7 @@ jobs:
           node-version: 26
           cache: npm
       - name: Setup Socket Firewall
+        if: github.repository == 'workos/scim-bridge'
         uses: workos/setup-socket-firewall@195977cfa38ab4d70363af5403a106dbc54a61eb
         with:
           token: ${{ secrets.PUBLIC_SOCKET_FIREWALL_TOKEN }}

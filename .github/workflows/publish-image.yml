@@ -1,0 +1,103 @@
+name: Publish image
+
+on:
+  workflow_dispatch:
+    inputs:
+      suffix:
+        description: Image suffix
+        required: true
+        type: choice
+        default: dev
+        options:
+          - dev
+          - release
+      version:
+        description: Image version (x.y.z). Empty = upstream package.json patch + 1
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: writer-scim-bridge-publish
+  cancel-in-progress: false
+
+env:
+  IMAGE: us-docker.pkg.dev/writer-shared/writer/scim-bridge
+
+jobs:
+  checks:
+    if: github.repository == 'WriterColab/scim-bridge' && github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    needs: checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 26
+      - name: Prepare image tag
+        id: tag
+        env:
+          SUFFIX: ${{ inputs.suffix }}
+          VERSION_OVERRIDE: ${{ inputs.version }}
+        run: |
+          if [[ -n "$VERSION_OVERRIDE" ]]; then
+            if [[ ! "$VERSION_OVERRIDE" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "Version must be x.y.z, got: $VERSION_OVERRIDE" >&2
+              exit 1
+            fi
+            VERSION="$VERSION_OVERRIDE"
+          else
+            VERSION=$(node -p 'const [major, minor, patch] = require("./package.json").version.split(".").map(Number); [major, minor, patch + 1].join(".")')
+          fi
+          if [[ "$SUFFIX" != dev && "$SUFFIX" != release ]]; then
+            echo "Suffix must be dev or release" >&2
+            exit 1
+          fi
+          echo "value=${VERSION}-${SUFFIX}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - name: Build image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          provenance: false
+          tags: ${{ env.IMAGE }}:${{ steps.tag.outputs.value }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.tag.outputs.value }}
+          cache-from: type=gha,scope=writer-amd64
+          cache-to: type=gha,mode=max,scope=writer-amd64
+      - name: Run existing image checks
+        env:
+          TAG: ${{ steps.tag.outputs.value }}
+        run: |
+          .github/scripts/check-image-secrets.sh "$IMAGE:$TAG"
+          .github/scripts/smoke-test-image.sh "$IMAGE:$TAG"
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: projects/788018447969/locations/global/workloadIdentityPools/writer-iam-wip/providers/github-gar-write-20240221
+          service_account: github-gar-write-20240221@writer-iam.iam.gserviceaccount.com
+          token_format: access_token
+          access_token_lifetime: 900s
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+      - name: Push image
+        env:
+          TAG: ${{ steps.tag.outputs.value }}
+        run: |
+          gcloud --quiet auth configure-docker us-docker.pkg.dev
+          docker push "$IMAGE:$TAG"
+          echo "Published: \`$IMAGE:$TAG\`" >> "$GITHUB_STEP_SUMMARY"
