@@ -2,6 +2,8 @@ import { getDirectoryByToken } from "../shared/db";
 import { authorizationToken } from "../shared/scim";
 import {
   AmbiguousScimMappingError,
+  EventMappingError,
+  eventMappingStore,
   getUniqueScimMapping,
   verifiedWorkosEventMapping,
   verifyDsyncEventIdentity,
@@ -108,7 +110,9 @@ export async function handleStatus(request: Request, env: PocEnv, url: URL): Pro
     if (!dsyncId || !dsyncId.startsWith(kind === "Users" ? "directory_user_" : "directory_group_"))
       return statusError(400, "Supply a Directory Sync id matching the resource type.");
     try {
-      const linked = await getEventLink(env.DB, directory.id, kind, dsyncId);
+      const linked = await eventMappingStore(() =>
+        getEventLink(env.DB, directory.id, kind, dsyncId),
+      );
       if (linked)
         return mappingResponse(
           directory,
@@ -116,8 +120,7 @@ export async function handleStatus(request: Request, env: PocEnv, url: URL): Pro
           { native_id: linked.native_id, workos_id: linked.workos_id },
           dsyncId,
         );
-      if (url.searchParams.get("existing_only") === "1")
-        throw new Error("No verified existing event link");
+      if (url.searchParams.get("existing_only") === "1") throw new EventMappingError("no_link");
       if (!idpId || !name)
         return statusError(400, "Supply idp_id and userName or displayName to learn a binding.");
       const identity = {
@@ -126,20 +129,25 @@ export async function handleStatus(request: Request, env: PocEnv, url: URL): Pro
         [kind === "Users" ? "username" : "name"]: name,
         ...(externalId ? { raw_attributes: { externalId } } : {}),
       };
-      await verifyDsyncEventIdentity(directory, kind, identity, env.WORKOS_API_KEY);
-      const mapping = await verifiedWorkosEventMapping(env.DB, directory, kind, identity);
-      if (!mapping) throw new Error("No verified event mapping");
-      await bindEventLink(env.DB, {
-        directory_id: directory.id,
-        resource_type: kind,
-        dsync_id: dsyncId,
-        native_id: mapping.native_id,
-        workos_id: mapping.workos_id,
-      });
+      const current = await verifyDsyncEventIdentity(directory, kind, identity, env.WORKOS_API_KEY);
+      const mapping = await verifiedWorkosEventMapping(env.DB, directory, kind, identity, current);
+      if (!mapping) throw new EventMappingError("identity_unconfirmed");
+      await eventMappingStore(() =>
+        bindEventLink(env.DB, {
+          directory_id: directory.id,
+          resource_type: kind,
+          dsync_id: dsyncId,
+          native_id: mapping.native_id,
+          workos_id: mapping.workos_id,
+        }),
+      );
       return mappingResponse(directory, kind, mapping, dsyncId);
-    } catch {
+    } catch (error) {
       return Response.json(
-        { error: "The proxy could not confirm a unique SCIM mapping for this event identity." },
+        {
+          error: "The proxy could not confirm a unique SCIM mapping for this event identity.",
+          reason: error instanceof EventMappingError ? error.reason : "identity_unconfirmed",
+        },
         { status: 503, headers: { "Cache-Control": "no-store", "Retry-After": "5" } },
       );
     }

@@ -1,9 +1,54 @@
-import { getDirectoryById, getMappingByWorkosId } from "./db";
+import { AmbiguousScimMappingError, getDirectoryById, getMappingByWorkosId } from "./db";
 export { AmbiguousScimMappingError } from "./db";
 import { isRecord, isSuccess, joinScimUrl, parseJson, scimFetch } from "./scim";
-import { getEventLink } from "./event-links";
+import { EventLinkConflictError, getEventLink } from "./event-links";
 import type { Datastore } from "./datastore";
 import type { Directory, IdMapping, ResourceType } from "./types";
+
+export type EventMappingReason =
+  | "no_link"
+  | "learning_disabled"
+  | "directory_unconfigured"
+  | "dsync_resource_gone"
+  | "identity_unconfirmed"
+  | "ambiguous"
+  | "link_conflict"
+  | "upstream_unavailable"
+  | "store_error";
+
+/** Only a fixed reason crosses the status API; upstream/store details stay internal. */
+export class EventMappingError extends Error {
+  constructor(public readonly reason: EventMappingReason) {
+    super(`Event mapping unresolved: ${reason}`);
+  }
+}
+
+/** Classify at the store boundary so network failures cannot masquerade as DB errors. */
+export async function eventMappingStore<T>(operation: () => Promise<T>): Promise<T> {
+  try {
+    return await operation();
+  } catch (error) {
+    throw new EventMappingError(
+      error instanceof AmbiguousScimMappingError
+        ? "ambiguous"
+        : error instanceof EventLinkConflictError
+          ? "link_conflict"
+          : "store_error",
+    );
+  }
+}
+
+async function fetchEventScimIdentity(url: string, token: string) {
+  try {
+    return await scimFetch(url, { method: "GET", token });
+  } catch {
+    throw new EventMappingError("upstream_unavailable");
+  }
+}
+
+function scimLookupFailure(status: number): EventMappingError {
+  return new EventMappingError(status >= 500 ? "upstream_unavailable" : "identity_unconfirmed");
+}
 
 /** Directory Sync ids address a different API from the SCIM ids in id_mappings. */
 export function isDirectorySyncResourceId(id: string): boolean {
@@ -83,21 +128,25 @@ export async function verifiedWorkosEventMapping(
   directory: Directory,
   kind: ResourceType,
   resource: Record<string, unknown>,
+  current?: Record<string, unknown>,
 ): Promise<IdMapping | null> {
   const raw = isRecord(resource.raw_attributes) ? resource.raw_attributes : {};
   const candidates = [stringValue(raw.externalId), stringValue(resource.idp_id)];
   for (const candidate of new Set(candidates)) {
     if (!candidate) continue;
-    const mapping = await getUniqueScimMapping(db, directory.id, kind, candidate);
+    const mapping = await eventMappingStore(() =>
+      getUniqueScimMapping(db, directory.id, kind, candidate),
+    );
     if (!mapping) continue;
-    const response = await scimFetch(
+    const response = await fetchEventScimIdentity(
       joinScimUrl(directory.workos_url, `/${kind}/${encodeURIComponent(mapping.workos_id)}`),
-      { method: "GET", token: directory.workos_token },
+      directory.workos_token,
     );
     if (response.status === 404) continue;
-    if (!isSuccess(response.status))
-      throw new Error(`WorkOS SCIM identity lookup returned ${response.status}`);
+    if (!isSuccess(response.status)) throw scimLookupFailure(response.status);
     const resolved = parseJson(response.bodyText);
+    // Keep the original candidate proof: D alone must also exclude name
+    // collisions through the complete listing below before returning any id.
     if (resolved?.id === mapping.workos_id && matchesEventIdentity(kind, resource, resolved)) {
       return mapping;
     }
@@ -105,16 +154,20 @@ export async function verifiedWorkosEventMapping(
 
   const attribute = kind === "Users" ? "userName" : "displayName";
   const value = eventName(kind, resource) ?? stringValue(resource.idp_id);
-  if (!value) throw new Error("Event has no usable SCIM identity attributes");
+  if (!value) throw new EventMappingError("identity_unconfirmed");
   const filter = `${attribute} eq ${JSON.stringify(value)}`;
-  const response = await scimFetch(
+  const response = await fetchEventScimIdentity(
     `${joinScimUrl(directory.workos_url, `/${kind}`)}?filter=${encodeURIComponent(filter)}&startIndex=1&count=2`,
-    { method: "GET", token: directory.workos_token },
+    directory.workos_token,
   );
-  if (!isSuccess(response.status))
-    throw new Error(`WorkOS SCIM identity lookup returned ${response.status}`);
+  if (!isSuccess(response.status)) throw scimLookupFailure(response.status);
   const listing = parseJson(response.bodyText);
   const resources = listing?.Resources;
+  if (
+    (Number.isInteger(listing?.totalResults) && Number(listing?.totalResults) > 1) ||
+    (Array.isArray(resources) && resources.length > 1)
+  )
+    throw new EventMappingError("ambiguous");
   if (
     !listing ||
     !Array.isArray(resources) ||
@@ -125,16 +178,16 @@ export async function verifiedWorkosEventMapping(
     listing.itemsPerPage !== resources.length ||
     resources.some((entry) => !isRecord(entry))
   ) {
-    throw new Error("WorkOS SCIM identity lookup is incomplete or ambiguous");
+    throw new EventMappingError("identity_unconfirmed");
   }
   const resolved = resources[0];
   if (!resolved) return null;
-  if (resolved[attribute] !== value || !matchesEventIdentity(kind, resource, resolved)) {
-    throw new Error("WorkOS SCIM lookup did not confirm the event identity");
+  if (resolved[attribute] !== value || !matchesEventIdentity(kind, resource, resolved, current)) {
+    throw new EventMappingError("identity_unconfirmed");
   }
   const scimId = stringValue(resolved.id);
-  if (!scimId) throw new Error("WorkOS SCIM identity has no resource id");
-  return getUniqueScimMapping(db, directory.id, kind, scimId);
+  if (!scimId) throw new EventMappingError("identity_unconfirmed");
+  return eventMappingStore(() => getUniqueScimMapping(db, directory.id, kind, scimId));
 }
 
 /** Legacy databases may contain several native ids for one WorkOS resource. */
@@ -169,21 +222,35 @@ export async function verifyDsyncEventIdentity(
   kind: ResourceType,
   event: Record<string, unknown>,
   apiKey: string | undefined,
-): Promise<void> {
+): Promise<Record<string, unknown>> {
   const id = stringValue(event.id);
-  if (!apiKey || !id || !id.startsWith(kind === "Users" ? "directory_user_" : "directory_group_"))
-    throw new Error(
-      "Learning a Directory Sync binding requires WORKOS_API_KEY and an exact resource id",
+  if (!apiKey) throw new EventMappingError("learning_disabled");
+  if (!directory.workos_directory_id) throw new EventMappingError("directory_unconfigured");
+  if (!id || !id.startsWith(kind === "Users" ? "directory_user_" : "directory_group_"))
+    throw new EventMappingError("identity_unconfirmed");
+  let response: Response;
+  try {
+    response = await fetch(
+      `https://api.workos.com/${kind === "Users" ? "directory_users" : "directory_groups"}/${encodeURIComponent(id)}`,
+      {
+        headers: { Authorization: `Bearer ${apiKey}` },
+        signal: AbortSignal.timeout(2_000),
+      },
     );
-  const response = await fetch(
-    `https://api.workos.com/${kind === "Users" ? "directory_users" : "directory_groups"}/${encodeURIComponent(id)}`,
-    {
-      headers: { Authorization: `Bearer ${apiKey}` },
-      signal: AbortSignal.timeout(2_000),
-    },
-  );
-  if (!response.ok) throw new Error(`Directory Sync identity lookup returned ${response.status}`);
-  const current: unknown = await response.json();
+  } catch {
+    throw new EventMappingError("upstream_unavailable");
+  }
+  if (response.status === 404) throw new EventMappingError("dsync_resource_gone");
+  if (!response.ok) throw scimLookupFailure(response.status);
+  let current: unknown;
+  try {
+    current = await response.json();
+  } catch (error) {
+    // Invalid JSON is no identity proof; a failed body read is an upstream outage.
+    throw new EventMappingError(
+      error instanceof SyntaxError ? "identity_unconfirmed" : "upstream_unavailable",
+    );
+  }
   if (
     !isRecord(current) ||
     current.object !== (kind === "Users" ? "directory_user" : "directory_group") ||
@@ -192,7 +259,7 @@ export async function verifyDsyncEventIdentity(
     current.idp_id !== event.idp_id ||
     eventName(kind, current) !== eventName(kind, event)
   )
-    throw new Error("Directory Sync lookup did not confirm the exact event identity");
+    throw new EventMappingError("identity_unconfirmed");
   const raw = isRecord(event.raw_attributes) ? event.raw_attributes : {};
   const currentRaw = isRecord(current.raw_attributes) ? current.raw_attributes : {};
   if (
@@ -200,7 +267,8 @@ export async function verifyDsyncEventIdentity(
     stringValue(currentRaw.externalId) &&
     raw.externalId !== currentRaw.externalId
   )
-    throw new Error("Directory Sync external identity changed");
+    throw new EventMappingError("identity_unconfirmed");
+  return current;
 }
 
 /** A mapping key spelling alone cannot prove that the event names its resource. */
@@ -208,6 +276,7 @@ export function matchesEventIdentity(
   kind: ResourceType,
   event: Record<string, unknown>,
   scim: Record<string, unknown>,
+  current?: Record<string, unknown>,
 ): boolean {
   const raw = isRecord(event.raw_attributes) ? event.raw_attributes : {};
   const external = stringValue(raw.externalId) ?? stringValue(event.idp_id);
@@ -225,12 +294,34 @@ export function matchesEventIdentity(
     scim.displayName === name
   )
     return true;
-  return (
+  if (
     !stringValue(scim.externalId) &&
     !!name &&
     scim[attribute] === name &&
     (!external || external === name)
+  )
+    return true;
+  // Migrated group PUTs can drop externalId while DSync keeps the SCIM id as
+  // idp_id. A request omission cannot prove that loss: require the authenticated
+  // current record too, and never accept malformed externalIds as absence.
+  const currentRaw = current && isRecord(current.raw_attributes) ? current.raw_attributes : {};
+  return (
+    kind === "Groups" &&
+    current !== undefined &&
+    !!stringValue(event.name) &&
+    !!stringValue(event.idp_id) &&
+    current.name === event.name &&
+    current.idp_id === event.idp_id &&
+    scim.id === current.idp_id &&
+    scim.displayName === current.name &&
+    absentExternalId(raw.externalId) &&
+    absentExternalId(currentRaw.externalId) &&
+    absentExternalId(scim.externalId)
   );
+}
+
+function absentExternalId(value: unknown): boolean {
+  return value === undefined || value === null || value === "";
 }
 
 /** Refuse to turn an unresolved Directory Sync id into a new native SCIM row. */

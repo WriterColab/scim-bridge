@@ -291,8 +291,9 @@ and WorkOS SCIM identity, then returns its `native_id`. This also
 handles `fallback-post`, where native and WorkOS SCIM ids differ.
 
 `idp_id` does **not** always equal the SCIM id. SCIM users normally derive it
-from `externalId`, or `userName` when absent; current groups use `externalId`,
-while older groups may retain a display name. If no verified Directory Sync
+from `externalId`, or `userName` when absent; groups may use `externalId`,
+retain a legacy display name, or retain a migrated SCIM id after a group PUT
+drops `externalId`. If no verified Directory Sync
 association exists, use the bridge's identity resolver:
 
 ```http
@@ -310,7 +311,17 @@ that directory's WorkOS SCIM credential. The customer listener needs only the
 directory proxy token; neither WorkOS secret is returned. A candidate SCIM id
 requires a verified WorkOS resource identity; otherwise the bridge filters by the exact `userName` /
 `displayName`, validates one complete unique match and its external identity,
-then loads the durable mapping by its returned SCIM id. This provisions a
+then loads the durable mapping by its returned SCIM id. For externalId-less
+groups, an additional proof accepts only nonempty event/current names and
+`idp_id` values where `scim.id === current.idp_id === event.idp_id` and
+`scim.displayName === current.name === event.name`. The event's and authenticated
+current DSync record's `raw_attributes.externalId`, and the SCIM row's
+`externalId`, must all be absent (`undefined`, `null`, or `""`); malformed
+non-string values cannot prove absence. Omitting the query parameter cannot
+hide an externalId present in the authenticated current record. This proof
+also requires a complete unique `displayName` listing returning that same SCIM
+id, even when the direct candidate GET matched. It applies only to groups;
+existing externalId and legacy-name proofs keep their behavior. This provisions a
 post-cutover user with no `externalId`, whose randomly minted SCIM id differs
 from the event's username-valued `idp_id`. An unavailable, absent, ambiguous,
 unmapped or mismatched identity returns `503` with `Retry-After: 5`; keep the
@@ -319,6 +330,35 @@ retryable. Missing required attributes return `400`. A learned response includes
 `dsync_id` alongside the mapping fields shown above, and persists an immutable
 directory-scoped association between the Directory Sync, native and SCIM ids.
 Conflicting ownership on any of those ids is refused.
+
+Event-mapping `503` responses keep the generic `error` text and add a fixed
+machine-readable `reason`. They retain `Cache-Control: no-store` and
+`Retry-After: 5`, and never include upstream errors, credentials, or other
+directories' data:
+
+```json
+{
+  "error": "The proxy could not confirm a unique SCIM mapping for this event identity.",
+  "reason": "dsync_resource_gone"
+}
+```
+
+| Reason | Meaning |
+| --- | --- |
+| `no_link` | `existing_only=1` found no stored binding. |
+| `learning_disabled` | The bridge has no `WORKOS_API_KEY`. |
+| `directory_unconfigured` | The directory has no `workos_directory_id`. |
+| `dsync_resource_gone` | The Directory Sync API returned `404` for the requested id. |
+| `identity_unconfirmed` | DSync or SCIM identity did not match, a listing was incomplete/malformed, or no mapping exists. |
+| `ambiguous` | Multiple native owners or a non-unique SCIM listing prevents confirmation. |
+| `link_conflict` | An immutable link already reserves an id for another owner. |
+| `upstream_unavailable` | WorkOS API/SCIM timed out, failed over the network, or returned `5xx`. |
+| `store_error` | A bridge datastore operation failed. |
+
+Older bridges omit `reason`; consumers must treat missing or unknown reasons as
+retryable unresolved identities. A gone resource without a retained binding
+needs verified operator recovery; the reason does not establish ownership or
+authorize acknowledging a missed deletion/removal.
 
 Persist the verified Directory Sync association under the consumer's own
 directory key before writing the native resource. The standalone reference

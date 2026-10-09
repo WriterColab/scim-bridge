@@ -10,6 +10,13 @@ export interface EventLink {
   workos_id: string;
 }
 
+/** Distinguish refused ownership changes from datastore failures. */
+export class EventLinkConflictError extends Error {
+  constructor() {
+    super("Directory Sync event link conflicts with an established resource owner");
+  }
+}
+
 export async function getEventLink(
   db: Datastore,
   directoryId: string,
@@ -66,6 +73,6 @@ export async function bindEventLink(db: Datastore, link: EventLink): Promise<voi
   // readback distinguishes an identical retry from any attempted reassignment.
   const stored = await getEventLink(db, directory_id, resource_type, dsync_id);
   if (!stored || stored.native_id !== native_id || stored.workos_id !== workos_id) {
-    throw new Error("Directory Sync event link conflicts with an established resource owner");
+    throw new EventLinkConflictError();
   }
 }
