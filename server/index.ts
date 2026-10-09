@@ -1,6 +1,7 @@
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { serve } from "@hono/node-server";
+import { createServer } from "node:http";
+import { getRequestListener } from "@hono/node-server";
 import { serveStatic } from "@hono/node-server/serve-static";
 import { Hono } from "hono";
 import { createRequestHandler, RouterContextProvider } from "react-router";
@@ -26,7 +27,8 @@ import {
   seedNativeAppConfig,
   seedNativeAppDirectories,
 } from "./config";
-import { panelCsrfGuard, withOriginScheme } from "./csrf";
+import { panelCsrfGuard } from "./csrf";
+import { withForwardedProto } from "./forwarded-proto";
 import { openDatabase, SqliteDatastore, SqliteMigrator } from "./db/sqlite";
 import { inspectStorage } from "./db/storage-durability";
 import { openPostgres, PostgresDatastore, PostgresMigrator } from "./db/postgres";
@@ -249,7 +251,7 @@ async function mountBridge(): Promise<void> {
     const context = new RouterContextProvider();
     context.set(datastoreContext, store);
     context.set(demoModeContext, config.demoMode);
-    return requestHandler(withOriginScheme(c.req.raw), context);
+    return requestHandler(c.req.raw, context);
   });
 }
 
@@ -264,30 +266,39 @@ if (config.role === "native-app") {
   await mountBridge();
 }
 
-serve({ fetch: app.fetch, port: config.port, hostname: "0.0.0.0" }, (info) => {
-  console.log(`scim-bridge listening on http://0.0.0.0:${info.port}`);
-  if (config.role === "native-app") {
-    console.log(`  native SCIM base URL: ${config.publicUrl}/scim/v2`);
-    console.log(`  DSync webhook URL: ${config.publicUrl}/webhooks/dsync`);
-  } else {
-    console.log(`  control panel: ${config.publicUrl}/panel`);
-    console.log(`  SCIM base URL: ${config.publicUrl}/scim/v2`);
-    // Loud on every boot, not once at setup: an operator who set this to get
-    // past the refusal, meaning to put a proxy in front, should be reminded
-    // every time the container restarts until they have.
-    if (config.panelAuthDisabled) {
-      console.warn(
-        "  WARNING: PANEL_AUTH_DISABLED=true — /panel is unauthenticated and serves " +
-          "every directory's native and WorkOS bearer tokens to anyone who can reach it.",
-      );
+const listener = getRequestListener(app.fetch, { hostname: "0.0.0.0" });
+// The scheme is fixed where the request enters, so nothing downstream rebuilds it.
+createServer(config.trustProxy ? withForwardedProto(listener) : listener).listen(
+  config.port,
+  "0.0.0.0",
+  () => {
+    console.log(`scim-bridge listening on http://0.0.0.0:${config.port}`);
+    if (config.role === "native-app") {
+      console.log(`  native SCIM base URL: ${config.publicUrl}/scim/v2`);
+      console.log(`  DSync webhook URL: ${config.publicUrl}/webhooks/dsync`);
+    } else {
+      console.log(`  control panel: ${config.publicUrl}/panel`);
+      console.log(`  SCIM base URL: ${config.publicUrl}/scim/v2`);
+      // Loud on every boot, not once at setup: an operator who set this to get
+      // past the refusal, meaning to put a proxy in front, should be reminded
+      // every time the container restarts until they have.
+      if (config.panelAuthDisabled) {
+        console.warn(
+          "  WARNING: PANEL_AUTH_DISABLED=true — /panel is unauthenticated and serves " +
+            "every directory's native and WorkOS bearer tokens to anyone who can reach it.",
+        );
+      }
+      // Same cadence as the panel-auth warning: an operator who turned this off to
+      // script the panel should be reminded every restart until they turn it back on.
+      if (config.panelCsrfDisabled) {
+        console.warn(
+          "  WARNING: PANEL_CSRF_DISABLED=true — panel mutations are not checked for a same-origin " +
+            "initiator, so a logged-in operator's browser can be made to forge them cross-site.",
+        );
+      }
     }
-    // Same cadence as the panel-auth warning: an operator who turned this off to
-    // script the panel should be reminded every restart until they turn it back on.
-    if (config.panelCsrfDisabled) {
-      console.warn(
-        "  WARNING: PANEL_CSRF_DISABLED=true — panel mutations are not checked for a same-origin " +
-          "initiator, so a logged-in operator's browser can be made to forge them cross-site.",
-      );
+    if (config.trustProxy) {
+      console.log("  TRUST_PROXY on: X-Forwarded-Proto=https marks a request as https");
     }
-  }
-});
+  },
+);
