@@ -1,7 +1,7 @@
 import { AmbiguousScimMappingError, getDirectoryById, getMappingByWorkosId } from "./db";
 export { AmbiguousScimMappingError } from "./db";
 import { isRecord, isSuccess, joinScimUrl, parseJson, scimFetch } from "./scim";
-import { EventLinkConflictError, getEventLink } from "./event-links";
+import { bindEventLink, EventLinkConflictError, getEventLink } from "./event-links";
 import type { Datastore } from "./datastore";
 import type { Directory, IdMapping, ResourceType } from "./types";
 
@@ -36,6 +36,46 @@ export async function eventMappingStore<T>(operation: () => Promise<T>): Promise
           : "store_error",
     );
   }
+}
+
+/** Kept distinct so the HTTP route preserves its input-validation 400. */
+export class MissingEventIdentityError extends Error {}
+
+/**
+ * The single learning path for listeners and pre-cutover preload. Saved links
+ * win before mutable identity checks: deletes must survive remote removal.
+ */
+export async function learnEventLink(
+  db: Datastore,
+  directory: Directory,
+  kind: ResourceType,
+  identity: Record<string, unknown>,
+  apiKey: string | undefined,
+  existingOnly = false,
+): Promise<{
+  mapping: { native_id: string; workos_id: string; strategy?: string };
+  alreadyLinked: boolean;
+}> {
+  const dsyncId = stringValue(identity.id);
+  if (!dsyncId) throw new EventMappingError("identity_unconfirmed");
+  const linked = await eventMappingStore(() => getEventLink(db, directory.id, kind, dsyncId));
+  if (linked) return { mapping: linked, alreadyLinked: true };
+  if (existingOnly) throw new EventMappingError("no_link");
+  if (!stringValue(identity.idp_id) || !eventName(kind, identity))
+    throw new MissingEventIdentityError();
+  const current = await verifyDsyncEventIdentity(directory, kind, identity, apiKey);
+  const mapping = await verifiedWorkosEventMapping(db, directory, kind, identity, current);
+  if (!mapping) throw new EventMappingError("identity_unconfirmed");
+  await eventMappingStore(() =>
+    bindEventLink(db, {
+      directory_id: directory.id,
+      resource_type: kind,
+      dsync_id: dsyncId,
+      native_id: mapping.native_id,
+      workos_id: mapping.workos_id,
+    }),
+  );
+  return { mapping, alreadyLinked: false };
 }
 
 async function fetchEventScimIdentity(url: string, token: string) {

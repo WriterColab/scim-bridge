@@ -1,3 +1,9 @@
+import { panelEventLinkOptions, setPanelDirectoryMode } from "./event-link-cutover";
+import { EventLinkResult, SwitchWithoutLinks } from "./event-link-result";
+import {
+  preloadForOperation,
+  type GroupEventLinkSummary,
+} from "../../../workers/shared/event-link-preload";
 import type { Route } from "./+types/directory-overview";
 import { useEffect, useRef, useState } from "react";
 
@@ -23,7 +29,6 @@ import {
   listNativeWriteFailures,
   setDirectoryLogPersistence,
   rotateProxyToken,
-  setDirectoryMode,
   setDirectoryNative,
   setDirectoryWorkos,
   setDirectoryWorkosDirectoryId,
@@ -72,6 +77,7 @@ interface TopologyResult {
 
 interface OverviewActionData {
   error?: string;
+  eventLinks?: GroupEventLinkSummary;
   backfill?: BackfillSummary;
   reconcile?: BackfillSummary;
   health?: HealthResult;
@@ -174,8 +180,13 @@ export async function action({
     if (!MODES.includes(mode as Mode)) {
       return { error: `That mode is not one of ${MODES.join(", ")}.` };
     }
-    await setDirectoryMode(db, directory.id, mode as Mode);
-    return {};
+    return setPanelDirectoryMode(
+      db,
+      directory,
+      mode as Mode,
+      await panelEventLinkOptions(db, directory, context.get(demoModeContext)),
+      form.get("switch_without_links") === "on",
+    );
   }
 
   if (intent === "rotate-proxy-token") {
@@ -255,6 +266,16 @@ export async function action({
     return {};
   }
 
+  if (intent === "preload-event-links") {
+    return {
+      eventLinks: await preloadForOperation(
+        db,
+        directory,
+        await panelEventLinkOptions(db, directory, context.get(demoModeContext)),
+      ),
+    };
+  }
+
   if (intent === "run-backfill") {
     // Available on workos-primary too: the proxy is still writing native there, so
     // a snapshot replay into WorkOS is as safe as it is on dual-write — and an
@@ -266,7 +287,11 @@ export async function action({
           "Backfill runs in dual-write or workos-primary mode, so live writes keep flowing while the snapshot replays.",
       };
     }
-    const backfill = await runBackfill(db, directory);
+    const backfill = await runBackfill(
+      db,
+      directory,
+      await panelEventLinkOptions(db, directory, context.get(demoModeContext)),
+    );
     return { backfill };
   }
 
@@ -281,7 +306,11 @@ export async function action({
       };
     }
     try {
-      const reconcile = await runReconcileFromWorkos(db, directory);
+      const reconcile = await runReconcileFromWorkos(
+        db,
+        directory,
+        await panelEventLinkOptions(db, directory, context.get(demoModeContext)),
+      );
       return { reconcile };
     } catch (error) {
       if (!(error instanceof ReconcileInFlightError)) throw error;
@@ -370,6 +399,7 @@ function LogPersistenceCard({ on, pending }: { on: boolean; pending: boolean }) 
 function ModeCard({ currentMode, pending }: { currentMode: Mode; pending: boolean }) {
   const submit = useSubmit();
   const [selected, setSelected] = useState<Mode>(currentMode);
+  const [override, setOverride] = useState(false);
   const dirty = selected !== currentMode;
   // The two transitions worth a confirmation are the two that change who writes
   // the native app: entering workos-only (the proxy goes silent toward native and
@@ -382,7 +412,11 @@ function ModeCard({ currentMode, pending }: { currentMode: Mode; pending: boolea
     currentMode === "workos-primary"
       ? "WorkOS is already answering the IdP, so authority does not move. What changes is who writes the native app: the proxy stops, and the customer's DSync event listener becomes the only feed. Confirm the listener is running and applying events — apply_dsync_events flips to true the moment this lands."
       : "The proxy will stop sending SCIM traffic to the native endpoint entirely — WorkOS becomes the only target. Enable the customer's DSync event listener first, or the native directory will go stale. Consider workos-primary first: it moves authority to WorkOS while the proxy keeps writing native, so this step is only about the listener.";
-  const applyMode = () => submit({ intent: "set-mode", mode: selected }, { method: "post" });
+  const applyMode = () =>
+    submit(
+      { intent: "set-mode", mode: selected, switch_without_links: override ? "on" : "" },
+      { method: "post" },
+    );
 
   return (
     <Card size="3">
@@ -429,6 +463,9 @@ function ModeCard({ currentMode, pending }: { currentMode: Mode; pending: boolea
                           : `The proxy will switch back to ${selected} and the untouched native SCIM handler resumes. Let in-flight DSync events drain first so the listener finishes applying everything WorkOS already accepted.`
                     }
                   />
+                  {isCutover && (
+                    <SwitchWithoutLinks checked={override} onCheckedChange={setOverride} />
+                  )}
                   <AlertDialog.Footer>
                     <AlertDialog.Cancel>
                       <Button>Cancel</Button>
@@ -612,6 +649,7 @@ function EndpointCard({
 function BackfillResult({ summary }: { summary: BackfillSummary }) {
   return (
     <Flex direction="column" gap="3">
+      {summary.eventLinks && <EventLinkResult summary={summary.eventLinks} />}
       <Grid columns={{ initial: "1", sm: "2" }} gap="3">
         {(["users", "groups"] as const).map((kind) => (
           <Flex key={kind} align="center" gap="2">
@@ -770,6 +808,22 @@ export default function DirectoryOverview() {
         currentMode={directory.mode}
         pending={pendingIntent === "set-mode"}
       />
+
+      <Card size="3">
+        <Flex direction="column" gap="4">
+          <CardHeader
+            title="Group event links"
+            description="Preload verified Directory Sync group identities before cutover, while groups are still live. Backfill and reconcile also run this step automatically."
+          />
+          <Form method="post">
+            <input type="hidden" name="intent" value="preload-event-links" />
+            <Button type="submit" loading={pendingIntent === "preload-event-links"}>
+              Preload event links
+            </Button>
+          </Form>
+          {actionData?.eventLinks && <EventLinkResult summary={actionData.eventLinks} />}
+        </Flex>
+      </Card>
 
       <LogPersistenceCard
         on={Boolean(directory.log_persistence)}

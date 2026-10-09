@@ -372,11 +372,41 @@ Cached binding responses include `dsync_id` and omit `strategy`; they survive
 both WorkOS resource deletion and SCIM mapping pruning, and require neither
 WorkOS API key nor upstream reads.
 
-Before cutover, preload each existing Directory Sync user/group by calling the
-resolver above while both upstream identities and mappings exist. This records
-the bridge binding; a standalone listener can fetch it on its first later event,
-including a deletion. The same calls can populate a custom consumer's durable
-cache. If neither side recorded a verified association before removal, keep the
+Before cutover, use **Preload event links** on the directory page, in any mode.
+It lists every live Directory Sync group (following pagination) and uses the
+same authenticated learning path as the resolver above. The summary shows total,
+newly linked, already linked, and gone counts, plus every failed group's Directory
+Sync id, name, and fixed reason. A missing `WORKOS_API_KEY` reports
+`learning_disabled`; a missing `workos_directory_id` reports
+`directory_unconfigured`. Listing failures mean coverage is unknown.
+
+Backfill runs this preload automatically after saving mappings. **Reconcile from
+WorkOS** runs it as step 0 before its existing snapshot/replay, after acquiring
+its existing claims. Both steps are best effort: preload failures appear alongside
+the replay summary and never change the backfill/reconcile resource counts or
+errors. Re-run preload after repairing configuration or identity failures.
+
+Every panel path into `workos-only` (directory page, bulk actions, Live state)
+runs preload first and refuses the switch if any live group failed or listing
+coverage is unknown. Groups confirmed `dsync_resource_gone` during the run are
+counted separately and do not block that gate. This does **not** authorize ignoring
+an unresolved deletion event. **Switch without links (emergency override)** is an
+explicit unchecked checkbox: it allows cutover despite failures and logs a warning.
+It can leave group updates/removals/deletions unresolved or halt the listener;
+use it only with an operator recovery plan. Other mode changes and leaving
+`workos-only` are not gated. Bulk actions report each directory's summary and
+refusals; directories that pass can switch even when another is refused.
+
+The preload covers **groups only**. Identity consumers still need their own user
+links; call the resolver while user identities and mappings exist, and retain those
+bindings durably. The group preload records the bridge binding; a standalone
+listener can fetch it on its first later event, including a deletion. The same
+resolver calls can populate a custom consumer's durable cache.
+
+In `DEMO_MODE`, only the designated simulator directory pointing at the bundled
+loopback `/__demo/native/mock-workos/scim/v2` mount skips preload and its gate,
+with a visible `bundled_simulator` summary. Mock events already carry SCIM ids.
+Real imported WorkOS directories remain gated, including when demo mode is on. If neither side recorded a verified association before removal, keep the
 event retryable and recover with verified operator evidence. A native name match
 does not establish ownership. Once confirmed,
 a missing mapped native row stays missing for delete/remove. Do not redirect it

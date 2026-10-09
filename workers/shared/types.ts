@@ -114,6 +114,7 @@ export interface ListenerEvent {
 }
 
 export interface BackfillSummary {
+  eventLinks?: import("./event-link-preload").GroupEventLinkSummary;
   users: { total: number; mirrored: number; failed: number };
   groups: { total: number; mirrored: number; failed: number };
   errors: string[];

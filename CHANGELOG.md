@@ -20,6 +20,16 @@ Container images for each version:
   and name, absent external ids, and a complete unique name listing. Existing
   ownership checks and retained links continue to protect delayed events.
 
+### Added
+
+- **Preload event links** on every directory page, with per-group failures and
+  reasons. Backfill preloads after saving mappings; Reconcile from WorkOS
+  preloads as step 0, both best effort. Every panel switch to `workos-only`
+  requires complete live-group link coverage, with an explicit **Switch without
+  links (emergency override)** checkbox and a warning log. Other mode changes
+  remain available without learning. Only the bundled simulator directory skips
+  the checks; identity consumers remain responsible for user links.
+
 ### Changed
 
 - Add machine-readable reasons to directory-token-scoped event-mapping `503`
