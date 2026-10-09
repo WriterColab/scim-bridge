@@ -324,7 +324,10 @@ Advance the directory's mode from its page, verifying convergence in the
 1. **passthrough** → confirm requests flow through to native unchanged.
 2. **dual-write (native-first)** → new writes now also mirror to WorkOS.
 3. **Run backfill** → copies existing native state into WorkOS (idempotent;
-   safe to re-run). Requires dual-write on. Failures in the summary are
+   safe to re-run). Available in dual-write and workos-primary. After saving
+   mappings it automatically preloads live Directory Sync group event links,
+   best effort; the link summary does not change the backfill result.
+   Failures in the backfill summary are
    usually the data, not the bridge —
    [workos-scim-requirements.md](./workos-scim-requirements.md) maps each
    WorkOS error to the audit that would have caught it.
@@ -349,7 +352,32 @@ Advance the directory's mode from its page, verifying convergence in the
 
    Backfill still runs here, so a directory that reaches this rung with WorkOS
    short a few resources does not have to drop back to fix it.
-6. **Cut over to workos-only** → confirm the AlertDialog. WorkOS is now
+6. **Preload event links**, then **Cut over to workos-only** → confirm the
+   AlertDialog. The preload button is available on the directory page in every
+   mode. Set `WORKOS_API_KEY` on the bridge and the directory's
+   `workos_directory_id`; missing configuration reports `learning_disabled` or
+   `directory_unconfigured`. The summary names every failed group with its
+   Directory Sync id and reason, alongside total, newly linked, already linked,
+   and gone counts. Repair failures and retry while the groups are still live:
+   deleted identities cannot learn their first binding.
+
+   Every panel cutover path (directory page, bulk actions, Live state) preloads
+   again and refuses the switch unless all live groups are linked and the listing
+   is complete. Groups confirmed gone during the run do not block cutover;
+   an unknown/incomplete listing does. User links remain the identity consumer's
+   responsibility. Use a short provisioning freeze/drain for the final baseline
+   and verify membership parity and listener backlog before switching; preload
+   is a live snapshot, not a lock against later group creation.
+
+   **Switch without links (emergency override)** is an explicit, unchecked
+   checkbox on every cutover control. It permits the switch despite link failures
+   and logs a warning naming the directory. Unresolved group events can fail or
+   halt the listener: use only with an operator recovery plan. Leaving
+   `workos-only` and other mode changes are not gated. Bulk actions show each
+   directory's summary and refusal; passing directories can switch while others
+   stay in their current mode.
+
+   WorkOS is now
    authoritative; provision your app from WorkOS Directory Sync events (the
    listener in `workers/native/listener.ts` is a reference implementation).
    Wire your listener's handle-vs-ignore decision to the directory's status
@@ -365,7 +393,13 @@ Advance the directory's mode from its page, verifying convergence in the
    Directory Sync `directory_user_…` / `directory_group_…` ids are expected
    to differ from the preserved native SCIM ids.
 
-   **Run Reconcile from WorkOS immediately after the flip.** The cutover is
+   **Run Reconcile from WorkOS immediately after the flip.** Its step 0
+   preloads event links before the existing snapshot/replay, after acquiring
+   its existing claims. Link learning is best effort: its summary is shown with
+   the reconcile result, and failures do not alter replay counts or errors.
+   Repair link failures separately and re-run preload.
+
+   The cutover is
    instantaneous on the proxy side — it stops writing the native app the same
    instant — while a listener that caches the status answer needs a moment to
    notice. An IdP write landing in that gap is written by nobody: the listener
@@ -575,7 +609,11 @@ the trade.
 `DEMO_MODE=true` mounts a simulated IdP + native app and seeds a pre-wired "Demo
 directory", so you can drive the whole loop with no real IdP or WorkOS account.
 Use the panel's **Live state** and **IdP simulator** tabs to seed and churn the
-directory and watch it converge.
+directory and watch it converge. Preload and the cutover link gate are skipped
+only for the designated simulator directory on the loopback
+`/__demo/native/mock-workos/scim/v2` mount, and the summary says so. Mock events
+use SCIM ids directly, so no Directory Sync API key is needed. Real imported
+WorkOS directories remain gated even when `DEMO_MODE` is enabled.
 
 The Events API poller self-wires here too: in demo mode it starts with no
 `WORKOS_API_KEY`, polling the mock WorkOS the demo itself mounts

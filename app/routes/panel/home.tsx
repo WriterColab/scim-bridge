@@ -1,3 +1,4 @@
+import { panelEventLinkOptions, setPanelDirectoryMode } from "./event-link-cutover";
 import type { Route } from "./+types/home";
 
 import { Form, redirect, useActionData, useLoaderData, useNavigation } from "react-router";
@@ -5,11 +6,11 @@ import {
   countNativeWriteFailures,
   type CreatedDirectory,
   getConfig,
+  getDirectoryById,
   insertDirectory,
   listDirectories,
   setConfig,
   setDirectoriesLogPersistence,
-  setDirectoryMode,
 } from "../../../workers/shared/db";
 import { datastoreContext, demoModeContext } from "../../context";
 import { demoDirectoryId, publishMintedToken } from "../../../workers/shared/client-tokens";
@@ -338,10 +339,33 @@ export async function action({ context, request }: Route.ActionArgs) {
       .split(",")
       .map((s) => s.trim())
       .filter(Boolean);
-    for (const id of ids) {
-      await setDirectoryMode(db, id, mode as Mode);
+    let bulkUpdated = 0;
+    const cutovers = [];
+    const errors = [];
+    for (const id of new Set(ids)) {
+      const directory = await getDirectoryById(db, id);
+      if (!directory) {
+        errors.push(`Directory ${id} was not found.`);
+        continue;
+      }
+      const result = await setPanelDirectoryMode(
+        db,
+        directory,
+        mode as Mode,
+        await panelEventLinkOptions(db, directory, demoMode),
+        form.get("switch_without_links") === "on",
+      );
+      if (result.eventLinks)
+        cutovers.push({ directory_id: id, name: directory.name, summary: result.eventLinks });
+      if (result.error) errors.push(`${directory.name}: ${result.error}`);
+      else bulkUpdated++;
     }
-    return { bulkUpdated: ids.length, bulkMode: mode };
+    return {
+      bulkUpdated,
+      bulkMode: mode,
+      cutovers,
+      ...(errors.length ? { error: errors.join(" ") } : {}),
+    };
   }
 
   if (intent === "bulk-set-log-persistence") {

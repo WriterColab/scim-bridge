@@ -1,6 +1,18 @@
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import { action as liveAction } from "../app/routes/panel/live";
+import { EventLinkResult, SwitchWithoutLinks } from "../app/routes/panel/event-link-result";
+import { runBackfill, runReconcileFromWorkos } from "../workers/shared/backfill";
+import { setDirectoryMode, setDirectoryWorkos, upsertMapping } from "../workers/shared/db";
+import { bindEventLink, getEventLink } from "../workers/shared/event-links";
+import {
+  groupEventLinksReady,
+  preloadGroupEventLinks,
+  type GroupEventLinkSummary,
+} from "../workers/shared/event-link-preload";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { RouterContextProvider } from "react-router";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { action, loader as homeLoader } from "../app/routes/panel/home";
 import { action as overviewAction } from "../app/routes/panel/directory-overview";
 import { datastoreContext, demoModeContext } from "../app/context";
@@ -394,7 +406,7 @@ async function postOverview(
     }),
     context,
     params: { id },
-  } as unknown as ActionFunctionArgs)) as { error?: string } | Response;
+  } as unknown as Parameters<typeof overviewAction>[0])) as { error?: string } | Response;
 }
 
 async function loadHome(
@@ -1022,5 +1034,485 @@ describe("save actions reject a dangerous upstream URL", () => {
     expect((await getDirectoryById(env.DB, dir.id))?.native_url).toBe(
       "http://127.0.0.1:8788/scim/v2",
     );
+  });
+});
+
+// Keep panel-route tests in the existing route-import test project boundary.
+describe("event-link preload and cutover", () => {
+  const API_KEY = "sk_test_preload";
+  const WORKOS_DIRECTORY = "directory_preload";
+  const group = (id: string, name = id) => ({
+    object: "directory_group",
+    id: `directory_group_${id}`,
+    directory_id: WORKOS_DIRECTORY,
+    idp_id: `scim-${id}`,
+    name,
+  });
+  const list = (resources: unknown[]) =>
+    Response.json({
+      Resources: resources,
+      totalResults: resources.length,
+      startIndex: 1,
+      itemsPerPage: resources.length,
+    });
+
+  let fake: FakeUpstreams | undefined;
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+    fake?.restore();
+  });
+
+  async function setup(groups = [group("incident", "G-live-01")]) {
+    const env = await createEnv();
+    const directory = await seedDirectory(env.DB, {
+      mode: "workos-primary",
+      workos_directory_id: WORKOS_DIRECTORY,
+    });
+    for (const g of groups)
+      await upsertMapping(env.DB, {
+        directory_id: directory.id,
+        resource_type: "Groups",
+        native_id: g.idp_id,
+        workos_id: g.idp_id,
+        strategy: "migrated-id",
+      });
+    fake = installFakeUpstreams();
+    const upstreamFetch = globalThis.fetch;
+    const apiCalls: URL[] = [];
+    const trace: string[] = [];
+    const state = {
+      pages: [groups] as (typeof groups)[],
+      status: new Map<string, number>(),
+      listingStatus: 200,
+      malformed: false,
+      repeatedCursor: false,
+      networkFailure: false,
+      currentDirectory: WORKOS_DIRECTORY,
+      scimIdentity: true,
+      active: 0,
+      peak: 0,
+    };
+    globalThis.fetch = async (input, init) => {
+      const request = input instanceof Request ? input : new Request(input, init);
+      const url = new URL(request.url);
+      trace.push(`${request.method} ${url.pathname}`);
+      if (url.origin !== "https://api.workos.com") return upstreamFetch(input, init);
+      apiCalls.push(url);
+      expect(request.headers.get("Authorization")).toBe(`Bearer ${API_KEY}`);
+      expect(request.signal).toBeDefined();
+      if (state.networkFailure) throw new Error(`network failure ${API_KEY} workos-secret`);
+      if (url.pathname === "/directory_groups") {
+        expect(url.searchParams.get("directory")).toBe(WORKOS_DIRECTORY);
+        expect(url.searchParams.get("limit")).toBe("100");
+        if (state.listingStatus !== 200)
+          return Response.json({ secret: API_KEY }, { status: state.listingStatus });
+        if (state.malformed) return Response.json({ data: groups, list_metadata: {} });
+        const page = Number(url.searchParams.get("after") ?? 0);
+        return Response.json({
+          data: state.pages[page],
+          list_metadata: {
+            after: state.repeatedCursor
+              ? "1"
+              : page + 1 < state.pages.length
+                ? String(page + 1)
+                : null,
+          },
+        });
+      }
+      const id = decodeURIComponent(url.pathname.split("/").at(-1)!);
+      state.active++;
+      state.peak = Math.max(state.peak, state.active);
+      await new Promise((resolve) => setTimeout(resolve, 2));
+      state.active--;
+      const current = groups.find((g) => g.id === id);
+      expect(current).toBeDefined();
+      return Response.json(
+        { ...current, directory_id: state.currentDirectory },
+        { status: state.status.get(id) ?? 200 },
+      );
+    };
+    fake.route("workos", "GET", /^\/Groups\//, (call) => {
+      const current = groups.find((g) => call.path === `/Groups/${g.idp_id}`)!;
+      return Response.json({ id: current.idp_id, displayName: current.name });
+    });
+    fake.route("workos", "GET", /^\/Groups\?/, (call) => {
+      const filter = new URL(`https://workos.test${call.path}`).searchParams.get("filter");
+      const matches = groups.filter((g) => filter === `displayName eq ${JSON.stringify(g.name)}`);
+      return list(
+        matches.map((g) => ({
+          id: g.idp_id,
+          displayName: state.scimIdentity ? g.name : "Wrong name",
+        })),
+      );
+    });
+    vi.stubEnv("WORKOS_API_KEY", API_KEY);
+    return { env, directory, groups, state, trace, apiCalls };
+  }
+
+  type ActionResult = {
+    error?: string;
+    eventLinks?: GroupEventLinkSummary;
+    backfill?: Awaited<ReturnType<typeof runBackfill>>;
+    bulkUpdated?: number;
+    cutovers?: { summary: GroupEventLinkSummary }[];
+  };
+  async function submit(
+    s: Awaited<ReturnType<typeof setup>>,
+    route: "overview" | "home" | "live",
+    fields: Record<string, string>,
+    demoMode = false,
+  ): Promise<ActionResult> {
+    const context = new RouterContextProvider();
+    context.set(datastoreContext, s.env.DB);
+    context.set(demoModeContext, demoMode);
+    const args = {
+      context,
+      params: { id: s.directory.id },
+      request: new Request("https://bridge.test/panel", {
+        method: "POST",
+        body: new URLSearchParams({ directoryId: s.directory.id, ids: s.directory.id, ...fields }),
+      }),
+    };
+    if (route === "overview")
+      return (await overviewAction(
+        args as unknown as Parameters<typeof overviewAction>[0],
+      )) as ActionResult;
+    if (route === "home")
+      return (await action(args as unknown as Parameters<typeof action>[0])) as ActionResult;
+    return (await liveAction(args as unknown as Parameters<typeof liveAction>[0])) as ActionResult;
+  }
+
+  function emptySnapshots() {
+    for (const target of ["native", "workos"] as const) {
+      fake!.route(target, "GET", /^\/Users\?/, () => list([]));
+      fake!.route(target, "GET", /^\/Groups\?startIndex=/, () => list([]));
+    }
+  }
+
+  describe("preload Directory Sync group event links", () => {
+    it("links every live group including incident-shaped externalId-less migrated groups", async () => {
+      const s = await setup([group("incident", "G-live-01"), group("second")]);
+      const result = await preloadGroupEventLinks(s.env.DB, s.directory, API_KEY);
+      expect(result).toEqual({ total: 2, newly_linked: 2, already_linked: 0, gone: 0, failed: [] });
+      for (const g of s.groups)
+        expect(await getEventLink(s.env.DB, s.directory.id, "Groups", g.id)).toMatchObject({
+          native_id: g.idp_id,
+          workos_id: g.idp_id,
+        });
+      expect(groupEventLinksReady(result)).toBe(true);
+    });
+
+    it("counts an existing link unchanged without fetching its mutable identity", async () => {
+      const s = await setup();
+      const link = {
+        directory_id: s.directory.id,
+        resource_type: "Groups" as const,
+        dsync_id: s.groups[0].id,
+        native_id: "old-native",
+        workos_id: "old-workos",
+      };
+      await bindEventLink(s.env.DB, link);
+      const result = await preloadGroupEventLinks(s.env.DB, s.directory, API_KEY);
+      expect(result).toMatchObject({ newly_linked: 0, already_linked: 1, failed: [] });
+      expect(await getEventLink(s.env.DB, s.directory.id, "Groups", link.dsync_id)).toEqual(link);
+      expect(s.apiCalls).toHaveLength(1);
+    });
+
+    it("follows pagination, deduplicates ids, and bounds group learning concurrency at four", async () => {
+      const groups = Array.from({ length: 11 }, (_, n) => group(String(n)));
+      const s = await setup(groups);
+      s.state.pages = [groups.slice(0, 7), groups.slice(6)];
+      const result = await preloadGroupEventLinks(s.env.DB, s.directory, API_KEY);
+      expect(result).toMatchObject({ total: 11, newly_linked: 11, failed: [] });
+      expect(
+        s.apiCalls
+          .filter((u) => u.pathname === "/directory_groups")
+          .map((u) => u.searchParams.get("after")),
+      ).toEqual([null, "1"]);
+      expect(s.state.peak).toBe(4);
+    });
+
+    it("ignores groups confirmed gone during learning for the cutover gate", async () => {
+      const s = await setup();
+      s.state.status.set(s.groups[0].id, 404);
+      const result = await preloadGroupEventLinks(s.env.DB, s.directory, API_KEY);
+      expect(result).toEqual({ total: 1, newly_linked: 0, already_linked: 0, gone: 1, failed: [] });
+      expect(groupEventLinksReady(result)).toBe(true);
+      expect(await getEventLink(s.env.DB, s.directory.id, "Groups", s.groups[0].id)).toBeNull();
+    });
+
+    it("lists each failed group with its fixed reason and excludes secrets", async () => {
+      const s = await setup([group("bad"), group("down")]);
+      s.state.status.set(s.groups[0].id, 403);
+      s.state.status.set(s.groups[1].id, 503);
+      const result = await preloadGroupEventLinks(s.env.DB, s.directory, API_KEY);
+      expect(result.failed).toEqual([
+        { dsync_id: s.groups[0].id, name: "bad", reason: "identity_unconfirmed" },
+        { dsync_id: s.groups[1].id, name: "down", reason: "upstream_unavailable" },
+      ]);
+      expect(groupEventLinksReady(result)).toBe(false);
+      expect(JSON.stringify(result)).not.toMatch(/sk_test|workos-secret/);
+    });
+
+    it("rejects wrong-directory identity and unconfirmed SCIM names", async () => {
+      const s = await setup();
+      s.state.currentDirectory = "directory_other";
+      expect((await preloadGroupEventLinks(s.env.DB, s.directory, API_KEY)).failed[0].reason).toBe(
+        "identity_unconfirmed",
+      );
+      s.state.currentDirectory = WORKOS_DIRECTORY;
+      s.state.scimIdentity = false;
+      expect((await preloadGroupEventLinks(s.env.DB, s.directory, API_KEY)).failed[0].reason).toBe(
+        "identity_unconfirmed",
+      );
+    });
+
+    it("reports store errors without exposing database details", async () => {
+      const s = await setup();
+      const prepare = s.env.DB.prepare.bind(s.env.DB);
+      vi.spyOn(s.env.DB, "prepare").mockImplementation((sql) => {
+        if (sql.includes("dsync_event_links")) throw new Error("database secret");
+        return prepare(sql);
+      });
+      expect((await preloadGroupEventLinks(s.env.DB, s.directory, API_KEY)).failed[0].reason).toBe(
+        "store_error",
+      );
+    });
+
+    it.each(["malformed", "repeatedCursor", "networkFailure"] as const)(
+      "fails closed on a %s listing",
+      async (failure) => {
+        const s = await setup();
+        s.state[failure] = true;
+        const result = await preloadGroupEventLinks(s.env.DB, s.directory, API_KEY);
+        expect(result.reason).toBe(
+          failure === "networkFailure" ? "upstream_unavailable" : "identity_unconfirmed",
+        );
+        expect(groupEventLinksReady(result)).toBe(false);
+      },
+    );
+
+    it("fails closed on a listing outage, not treating it as an empty directory", async () => {
+      const s = await setup();
+      s.state.listingStatus = 503;
+      expect(await preloadGroupEventLinks(s.env.DB, s.directory, API_KEY)).toMatchObject({
+        reason: "upstream_unavailable",
+        total: 0,
+      });
+    });
+
+    it("reports missing configuration without upstream calls", async () => {
+      const s = await setup();
+      expect(await preloadGroupEventLinks(s.env.DB, s.directory, undefined)).toMatchObject({
+        reason: "learning_disabled",
+      });
+      expect(
+        await preloadGroupEventLinks(
+          s.env.DB,
+          { ...s.directory, workos_directory_id: null },
+          API_KEY,
+        ),
+      ).toMatchObject({ reason: "directory_unconfigured" });
+      expect(s.apiCalls).toHaveLength(0);
+    });
+  });
+
+  describe("panel preloads and cutover", () => {
+    it.each(["passthrough", "dual-write", "workos-primary", "workos-only"] as const)(
+      "allows the preload action in %s",
+      async (mode) => {
+        const s = await setup();
+        await setDirectoryMode(s.env.DB, s.directory.id, mode);
+        const result = await submit(s, "overview", { intent: "preload-event-links" });
+        expect(result.eventLinks).toMatchObject({ newly_linked: 1, failed: [] });
+        expect((await getDirectoryById(s.env.DB, s.directory.id))?.mode).toBe(mode);
+      },
+    );
+
+    it.each(["overview", "home", "live"] as const)(
+      "refuses an unlinked live group via %s",
+      async (route) => {
+        const s = await setup();
+        s.state.status.set(s.groups[0].id, 503);
+        const result = await submit(s, route, {
+          intent: route === "home" ? "bulk-set-mode" : "set-mode",
+          mode: "workos-only",
+        });
+        expect(result.error).toMatch(/Cutover refused/);
+        expect((result.eventLinks ?? result.cutovers?.[0].summary)?.failed).toEqual([
+          { dsync_id: s.groups[0].id, name: "G-live-01", reason: "upstream_unavailable" },
+        ]);
+        expect((await getDirectoryById(s.env.DB, s.directory.id))?.mode).toBe("workos-primary");
+      },
+    );
+
+    it.each(["overview", "home", "live"] as const)(
+      "allows %s cutover when every live group is linked",
+      async (route) => {
+        const s = await setup();
+        const result = await submit(s, route, {
+          intent: route === "home" ? "bulk-set-mode" : "set-mode",
+          mode: "workos-only",
+        });
+        expect(result.error).toBeUndefined();
+        expect((await getDirectoryById(s.env.DB, s.directory.id))?.mode).toBe("workos-only");
+        expect(
+          await getEventLink(s.env.DB, s.directory.id, "Groups", s.groups[0].id),
+        ).not.toBeNull();
+      },
+    );
+
+    it.each(["overview", "home", "live"] as const)(
+      "requires the explicit checkbox value to override %s cutover and logs a warning",
+      async (route) => {
+        const s = await setup();
+        s.state.listingStatus = 503;
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+        const fields = {
+          intent: route === "home" ? "bulk-set-mode" : "set-mode",
+          mode: "workos-only",
+        };
+        expect((await submit(s, route, { ...fields, switch_without_links: "true" })).error).toMatch(
+          /Cutover refused/,
+        );
+        expect(
+          (await submit(s, route, { ...fields, switch_without_links: "on" })).error,
+        ).toBeUndefined();
+        expect((await getDirectoryById(s.env.DB, s.directory.id))?.mode).toBe("workos-only");
+        expect(warn).toHaveBeenCalledWith(
+          expect.stringContaining("Switch without links override used"),
+        );
+        expect(warn.mock.calls.flat().join(" ")).not.toContain(API_KEY);
+      },
+    );
+
+    it("blocks a keyless cutover despite an empty failed-group list", async () => {
+      const s = await setup();
+      vi.stubEnv("WORKOS_API_KEY", "");
+      const result = await submit(s, "overview", { intent: "set-mode", mode: "workos-only" });
+      expect(result.error).toMatch(/Cutover refused/);
+      expect(result.eventLinks).toMatchObject({ reason: "learning_disabled", failed: [] });
+    });
+
+    it.each(["overview", "home", "live"] as const)(
+      "does not gate other mode changes or leaving workos-only via %s",
+      async (route) => {
+        const s = await setup();
+        s.state.networkFailure = true;
+        for (const mode of ["passthrough", "dual-write", "workos-primary"] as const) {
+          await setDirectoryMode(s.env.DB, s.directory.id, "workos-only");
+          expect(
+            (
+              await submit(s, route, {
+                intent: route === "home" ? "bulk-set-mode" : "set-mode",
+                mode,
+              })
+            ).error,
+          ).toBeUndefined();
+          expect((await getDirectoryById(s.env.DB, s.directory.id))?.mode).toBe(mode);
+        }
+        expect(s.apiCalls).toHaveLength(0);
+      },
+    );
+
+    it("exempts only the bundled simulator; DEMO_MODE does not exempt real WorkOS", async () => {
+      const s = await setup();
+      vi.stubEnv("WORKOS_API_KEY", "");
+      expect(
+        (await submit(s, "overview", { intent: "set-mode", mode: "workos-only" }, true)).error,
+      ).toMatch(/Cutover refused/);
+      await setDirectoryWorkos(
+        s.env.DB,
+        s.directory.id,
+        "http://127.0.0.1:8080/__demo/native/mock-workos/scim/v2",
+        "mock",
+      );
+      const result = await submit(s, "overview", { intent: "set-mode", mode: "workos-only" }, true);
+      expect(result.error).toBeUndefined();
+      expect(result.eventLinks?.skipped).toBe("bundled_simulator");
+      expect(s.apiCalls).toHaveLength(0);
+    });
+
+    it("renders all failed groups, fixed reasons, summary counts, and an explicit unchecked emergency override", () => {
+      const summary: GroupEventLinkSummary = {
+        total: 3,
+        newly_linked: 1,
+        already_linked: 0,
+        gone: 0,
+        failed: [
+          { dsync_id: "directory_group_a", name: "Engineering", reason: "ambiguous" },
+          { dsync_id: "directory_group_b", name: "Sales", reason: "link_conflict" },
+        ],
+      };
+      const html = renderToStaticMarkup(createElement(EventLinkResult, { summary }));
+      expect(html).toMatch(/3 total/);
+      expect(html).toMatch(/1 newly linked/);
+      for (const g of summary.failed) {
+        expect(html).toContain(g.name);
+        expect(html).toContain(g.dsync_id);
+        expect(html).toContain(g.reason);
+      }
+      const override = renderToStaticMarkup(createElement(SwitchWithoutLinks));
+      expect(override).toContain('name="switch_without_links"');
+      expect(override).toContain("Switch without links (emergency override)");
+      expect(override).not.toContain('checked=""');
+    });
+  });
+
+  describe("automatic preload steps", () => {
+    it("runs after backfill mapping persistence and preserves success when preload fails", async () => {
+      const s = await setup();
+      s.state.status.set(s.groups[0].id, 503);
+      fake!.route("native", "GET", /^\/Users\?/, () => list([]));
+      fake!.route("native", "GET", /^\/Groups\?/, () =>
+        list([{ id: "new-native", displayName: "New" }]),
+      );
+      fake!.route("workos", "PUT", "/Groups/new-native", () =>
+        Response.json({ id: "new-native", displayName: "New" }),
+      );
+      const result = await submit(s, "overview", { intent: "run-backfill" });
+      expect(result.backfill?.groups).toEqual({ total: 1, mirrored: 1, failed: 0 });
+      expect(result.backfill?.errors).toEqual([]);
+      expect(result.backfill?.eventLinks?.failed[0].reason).toBe("upstream_unavailable");
+      expect(s.trace.indexOf("PUT /scim/v2/Groups/new-native")).toBeLessThan(
+        s.trace.indexOf("GET /directory_groups"),
+      );
+      const mapping = await s.env.DB.prepare(
+        "SELECT workos_id FROM id_mappings WHERE directory_id = ? AND native_id = ?",
+      )
+        .bind(s.directory.id, "new-native")
+        .first();
+      expect(mapping).toEqual({ workos_id: "new-native" });
+    });
+
+    it("backfill can learn newly persisted group mappings", async () => {
+      const s = await setup();
+      await s.env.DB.prepare("DELETE FROM id_mappings WHERE directory_id = ?")
+        .bind(s.directory.id)
+        .run();
+      fake!.route("native", "GET", /^\/Users\?/, () => list([]));
+      fake!.route("native", "GET", /^\/Groups\?/, () =>
+        list([{ id: s.groups[0].idp_id, displayName: s.groups[0].name }]),
+      );
+      fake!.route("workos", "PUT", `/Groups/${s.groups[0].idp_id}`, () =>
+        Response.json({ id: s.groups[0].idp_id, displayName: s.groups[0].name }),
+      );
+      const result = await runBackfill(s.env.DB, s.directory, { apiKey: API_KEY });
+      expect(result.groups.mirrored).toBe(1);
+      expect(result.eventLinks?.newly_linked).toBe(1);
+    });
+
+    it("runs reconcile preload before any SCIM snapshot and still reconciles when learning fails", async () => {
+      const s = await setup();
+      s.state.listingStatus = 503;
+      emptySnapshots();
+      const result = await runReconcileFromWorkos(s.env.DB, s.directory, { apiKey: API_KEY });
+      expect(s.trace[0]).toBe("GET /directory_groups");
+      expect(s.trace[1]).toBe("GET /scim/v2/Users");
+      expect(result.eventLinks?.reason).toBe("upstream_unavailable");
+      expect(result.errors).toEqual([]);
+      expect(result.users.failed + result.groups.failed).toBe(0);
+    });
   });
 });

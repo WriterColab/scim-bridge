@@ -124,6 +124,14 @@ describe("runBackfill", () => {
     const summary = await runBackfill(env.DB, directory);
 
     expect(summary).toEqual({
+      eventLinks: {
+        total: 0,
+        newly_linked: 0,
+        already_linked: 0,
+        gone: 0,
+        failed: [],
+        reason: "learning_disabled",
+      },
       users: { total: 2, mirrored: 2, failed: 0 },
       groups: { total: 1, mirrored: 1, failed: 0 },
       errors: [],
@@ -260,6 +268,14 @@ describe("runBackfill", () => {
     const second = await runBackfill(env.DB, directory);
 
     expect(second).toEqual({
+      eventLinks: {
+        total: 0,
+        newly_linked: 0,
+        already_linked: 0,
+        gone: 0,
+        failed: [],
+        reason: "learning_disabled",
+      },
       users: { total: 2, mirrored: 2, failed: 0 },
       groups: { total: 1, mirrored: 1, failed: 0 },
       errors: [],
@@ -465,6 +481,14 @@ describe("runBackfill", () => {
 
     const first = await runBackfill(env.DB, directory);
     expect(first).toEqual({
+      eventLinks: {
+        total: 0,
+        newly_linked: 0,
+        already_linked: 0,
+        gone: 0,
+        failed: [],
+        reason: "learning_disabled",
+      },
       users: { total: 1, mirrored: 1, failed: 0 },
       groups: { total: 1, mirrored: 1, failed: 0 },
       errors: [],
@@ -508,6 +532,14 @@ describe("runBackfill", () => {
     const summary = await runBackfill(env.DB, directory);
 
     expect(summary).toEqual({
+      eventLinks: {
+        total: 0,
+        newly_linked: 0,
+        already_linked: 0,
+        gone: 0,
+        failed: [],
+        reason: "learning_disabled",
+      },
       users: { total: 0, mirrored: 0, failed: 0 },
       groups: { total: 0, mirrored: 0, failed: 0 },
       errors: ["Users snapshot: native returned 500", "Groups snapshot: connection reset"],
@@ -840,6 +872,14 @@ describe("runReconcileFromWorkos", () => {
     const summary = await runReconcileFromWorkos(env.DB, directory);
 
     expect(summary).toEqual({
+      eventLinks: {
+        total: 0,
+        newly_linked: 0,
+        already_linked: 0,
+        gone: 0,
+        failed: [],
+        reason: "learning_disabled",
+      },
       users: { total: 2, mirrored: 2, failed: 0 },
       groups: { total: 1, mirrored: 1, failed: 0 },
       errors: [],
@@ -1605,6 +1645,14 @@ describe("runBackfill snapshot edges", () => {
     const summary = await runBackfill(env.DB, directory);
 
     expect(summary).toEqual({
+      eventLinks: {
+        total: 0,
+        newly_linked: 0,
+        already_linked: 0,
+        gone: 0,
+        failed: [],
+        reason: "learning_disabled",
+      },
       users: { total: 1, mirrored: 1, failed: 0 },
       groups: { total: 0, mirrored: 0, failed: 0 },
       errors: [],
@@ -1626,6 +1674,14 @@ describe("runBackfill snapshot edges", () => {
     // Users still mirror; the unusable Groups body is reported rather than read
     // as an empty directory.
     expect(summary).toEqual({
+      eventLinks: {
+        total: 0,
+        newly_linked: 0,
+        already_linked: 0,
+        gone: 0,
+        failed: [],
+        reason: "learning_disabled",
+      },
       users: { total: 1, mirrored: 1, failed: 0 },
       groups: { total: 0, mirrored: 0, failed: 0 },
       errors: ["Groups snapshot: native returned a list response that is not JSON"],
@@ -1679,6 +1735,14 @@ describe("runBackfill snapshot edges", () => {
     const summary = await runBackfill(env.DB, directory);
 
     expect(summary).toEqual({
+      eventLinks: {
+        total: 0,
+        newly_linked: 0,
+        already_linked: 0,
+        gone: 0,
+        failed: [],
+        reason: "learning_disabled",
+      },
       users: { total: 0, mirrored: 0, failed: 0 },
       groups: { total: 0, mirrored: 0, failed: 0 },
       errors: [],

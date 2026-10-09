@@ -1,3 +1,4 @@
+import { preloadForOperation, type GroupEventLinkOptions } from "./event-link-preload";
 import type { Datastore } from "./datastore";
 import type { BackfillSummary, Directory, ResourceType } from "./types";
 import { getEventLinkByNativeId } from "./event-links";
@@ -67,7 +68,11 @@ interface ResourceCounts {
  * Snapshot-then-replay: intentionally no guard against deletes that land
  * mid-backfill (the resurrection race the explainer documents).
  */
-export async function runBackfill(db: Datastore, directory: Directory): Promise<BackfillSummary> {
+export async function runBackfill(
+  db: Datastore,
+  directory: Directory,
+  eventLinkOptions: GroupEventLinkOptions = {},
+): Promise<BackfillSummary> {
   const summary: BackfillSummary = {
     users: { total: 0, mirrored: 0, failed: 0 },
     groups: { total: 0, mirrored: 0, failed: 0 },
@@ -142,6 +147,9 @@ export async function runBackfill(db: Datastore, directory: Directory): Promise<
   }
   await flushMappings(db, sink, summary.errors);
 
+  // Learn only after mappings are durable; a failed preload must not reclassify
+  // resources already mirrored successfully by the backfill.
+  summary.eventLinks = await preloadForOperation(db, directory, eventLinkOptions);
   return summary;
 }
 
@@ -326,6 +334,7 @@ export class ReconcileInFlightError extends Error {
 export async function runReconcileFromWorkos(
   db: Datastore,
   directory: Directory,
+  eventLinkOptions: GroupEventLinkOptions = {},
 ): Promise<BackfillSummary> {
   // One reconcile per directory at a time. The sweep stamp below is a single
   // mutable column, so a second run re-stamps the NULL tokens this one leaves on
@@ -355,10 +364,14 @@ export async function runReconcileFromWorkos(
 
     const state: ReconcileReplayState = { unresolvedWrite: false, writeStarted: false };
     try {
+      // Step 0 preserves live event identities before replay. Keep existing
+      // claims and replay semantics intact even when learning cannot complete.
+      const eventLinks = await preloadForOperation(db, directory, eventLinkOptions);
       // Reconciliation addresses the whole directory, so reject every ambiguous
       // owner before snapshots or native writes.
       await loadIdMaps(db, directory.id, { strict: true });
       const summary = await reconcileFromWorkos(db, directory, state);
+      summary.eventLinks = eventLinks;
       if (state.unresolvedWrite) {
         summary.errors.unshift(
           "Create claims retained: a native replay is unresolved. An operator must check both " +

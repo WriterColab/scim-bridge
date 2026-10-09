@@ -13,6 +13,31 @@ Container images for each version:
 
 ## [Unreleased]
 
+### Fixed
+
+- Learn migrated group event bindings after WorkOS SCIM loses `externalId`,
+  requiring authenticated current Directory Sync identity, matching SCIM id
+  and name, absent external ids, and a complete unique name listing. Existing
+  ownership checks and retained links continue to protect delayed events.
+
+### Added
+
+- **Preload event links** on every directory page, with per-group failures and
+  reasons. Backfill preloads after saving mappings; Reconcile from WorkOS
+  preloads as step 0, both best effort. Every panel switch to `workos-only`
+  requires complete live-group link coverage, with an explicit **Switch without
+  links (emergency override)** checkbox and a warning log. Other mode changes
+  remain available without learning. Only the bundled simulator directory skips
+  the checks; identity consumers remain responsible for user links.
+
+### Changed
+
+- Add machine-readable reasons to directory-token-scoped event-mapping `503`
+  responses, distinguishing missing links, disabled/unconfigured learning,
+  gone resources, unconfirmed/ambiguous identities, ownership conflicts,
+  upstream outages, and datastore failures. Status, retry headers, and generic
+  error text remain unchanged.
+
 ## [0.4.3] - 2026-10-06
 
 ### Fixed

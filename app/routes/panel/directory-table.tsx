@@ -1,3 +1,5 @@
+import { EventLinkResult, SwitchWithoutLinks } from "./event-link-result";
+import type { GroupEventLinkSummary } from "../../../workers/shared/event-link-preload";
 import { useEffect, useMemo, useState } from "react";
 import { Link, useFetcher } from "react-router";
 import type { Directory, Mode } from "../../../workers/shared/types";
@@ -10,7 +12,12 @@ import { ModeBadge } from "./ui";
 
 type SortKey = "name" | "mode" | "created_at";
 type SortDir = "asc" | "desc";
-type BulkResult = { bulkUpdated?: number; bulkMode?: string; error?: string };
+type BulkResult = {
+  bulkUpdated?: number;
+  bulkMode?: string;
+  error?: string;
+  cutovers?: { directory_id: string; name: string; summary: GroupEventLinkSummary }[];
+};
 
 const PAGE_SIZES = [25, 50, 100];
 
@@ -39,6 +46,7 @@ export function DirectoryTable({
   const [page, setPage] = useState(0);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [bulkMode, setBulkMode] = useState("");
+  const [override, setOverride] = useState(false);
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -76,9 +84,10 @@ export function DirectoryTable({
 
   // Clear the selection once a bulk change lands (the loader has revalidated).
   useEffect(() => {
-    if (fetcher.state === "idle" && fetcher.data?.bulkUpdated) {
+    if (fetcher.state === "idle" && fetcher.data?.bulkUpdated && !fetcher.data.error) {
       setSelected(new Set());
       setBulkMode("");
+      setOverride(false);
     }
   }, [fetcher.state, fetcher.data]);
 
@@ -113,7 +122,12 @@ export function DirectoryTable({
   function applyBulk() {
     if (!bulkMode || selected.size === 0) return;
     fetcher.submit(
-      { intent: "bulk-set-mode", mode: bulkMode, ids: [...selected].join(",") },
+      {
+        intent: "bulk-set-mode",
+        mode: bulkMode,
+        ids: [...selected].join(","),
+        switch_without_links: override ? "on" : "",
+      },
       { method: "post" },
     );
   }
@@ -208,6 +222,9 @@ export function DirectoryTable({
                 ))}
               </Select.Content>
             </Select.Root>
+            {bulkMode === "workos-only" && (
+              <SwitchWithoutLinks checked={override} onCheckedChange={setOverride} />
+            )}
             <Button
               variant="solid"
               disabled={!bulkMode}
@@ -232,6 +249,15 @@ export function DirectoryTable({
             ) : null}
           </Flex>
         )}
+
+        {fetcher.data?.cutovers?.map((result) => (
+          <Flex key={result.directory_id} direction="column" gap="2">
+            <Text weight="medium" size="2">
+              {result.name} ({result.directory_id})
+            </Text>
+            <EventLinkResult summary={result.summary} />
+          </Flex>
+        ))}
 
         <Table.Root>
           <Table.Header>

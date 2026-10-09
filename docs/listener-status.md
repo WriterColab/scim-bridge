@@ -291,8 +291,9 @@ and WorkOS SCIM identity, then returns its `native_id`. This also
 handles `fallback-post`, where native and WorkOS SCIM ids differ.
 
 `idp_id` does **not** always equal the SCIM id. SCIM users normally derive it
-from `externalId`, or `userName` when absent; current groups use `externalId`,
-while older groups may retain a display name. If no verified Directory Sync
+from `externalId`, or `userName` when absent; groups may use `externalId`,
+retain a legacy display name, or retain a migrated SCIM id after a group PUT
+drops `externalId`. If no verified Directory Sync
 association exists, use the bridge's identity resolver:
 
 ```http
@@ -310,7 +311,17 @@ that directory's WorkOS SCIM credential. The customer listener needs only the
 directory proxy token; neither WorkOS secret is returned. A candidate SCIM id
 requires a verified WorkOS resource identity; otherwise the bridge filters by the exact `userName` /
 `displayName`, validates one complete unique match and its external identity,
-then loads the durable mapping by its returned SCIM id. This provisions a
+then loads the durable mapping by its returned SCIM id. For externalId-less
+groups, an additional proof accepts only nonempty event/current names and
+`idp_id` values where `scim.id === current.idp_id === event.idp_id` and
+`scim.displayName === current.name === event.name`. The event's and authenticated
+current DSync record's `raw_attributes.externalId`, and the SCIM row's
+`externalId`, must all be absent (`undefined`, `null`, or `""`); malformed
+non-string values cannot prove absence. Omitting the query parameter cannot
+hide an externalId present in the authenticated current record. This proof
+also requires a complete unique `displayName` listing returning that same SCIM
+id, even when the direct candidate GET matched. It applies only to groups;
+existing externalId and legacy-name proofs keep their behavior. This provisions a
 post-cutover user with no `externalId`, whose randomly minted SCIM id differs
 from the event's username-valued `idp_id`. An unavailable, absent, ambiguous,
 unmapped or mismatched identity returns `503` with `Retry-After: 5`; keep the
@@ -319,6 +330,35 @@ retryable. Missing required attributes return `400`. A learned response includes
 `dsync_id` alongside the mapping fields shown above, and persists an immutable
 directory-scoped association between the Directory Sync, native and SCIM ids.
 Conflicting ownership on any of those ids is refused.
+
+Event-mapping `503` responses keep the generic `error` text and add a fixed
+machine-readable `reason`. They retain `Cache-Control: no-store` and
+`Retry-After: 5`, and never include upstream errors, credentials, or other
+directories' data:
+
+```json
+{
+  "error": "The proxy could not confirm a unique SCIM mapping for this event identity.",
+  "reason": "dsync_resource_gone"
+}
+```
+
+| Reason | Meaning |
+| --- | --- |
+| `no_link` | `existing_only=1` found no stored binding. |
+| `learning_disabled` | The bridge has no `WORKOS_API_KEY`. |
+| `directory_unconfigured` | The directory has no `workos_directory_id`. |
+| `dsync_resource_gone` | The Directory Sync API returned `404` for the requested id. |
+| `identity_unconfirmed` | DSync or SCIM identity did not match, a listing was incomplete/malformed, or no mapping exists. |
+| `ambiguous` | Multiple native owners or a non-unique SCIM listing prevents confirmation. |
+| `link_conflict` | An immutable link already reserves an id for another owner. |
+| `upstream_unavailable` | WorkOS API/SCIM timed out, failed over the network, or returned `5xx`. |
+| `store_error` | A bridge datastore operation failed. |
+
+Older bridges omit `reason`; consumers must treat missing or unknown reasons as
+retryable unresolved identities. A gone resource without a retained binding
+needs verified operator recovery; the reason does not establish ownership or
+authorize acknowledging a missed deletion/removal.
 
 Persist the verified Directory Sync association under the consumer's own
 directory key before writing the native resource. The standalone reference
@@ -332,11 +372,41 @@ Cached binding responses include `dsync_id` and omit `strategy`; they survive
 both WorkOS resource deletion and SCIM mapping pruning, and require neither
 WorkOS API key nor upstream reads.
 
-Before cutover, preload each existing Directory Sync user/group by calling the
-resolver above while both upstream identities and mappings exist. This records
-the bridge binding; a standalone listener can fetch it on its first later event,
-including a deletion. The same calls can populate a custom consumer's durable
-cache. If neither side recorded a verified association before removal, keep the
+Before cutover, use **Preload event links** on the directory page, in any mode.
+It lists every live Directory Sync group (following pagination) and uses the
+same authenticated learning path as the resolver above. The summary shows total,
+newly linked, already linked, and gone counts, plus every failed group's Directory
+Sync id, name, and fixed reason. A missing `WORKOS_API_KEY` reports
+`learning_disabled`; a missing `workos_directory_id` reports
+`directory_unconfigured`. Listing failures mean coverage is unknown.
+
+Backfill runs this preload automatically after saving mappings. **Reconcile from
+WorkOS** runs it as step 0 before its existing snapshot/replay, after acquiring
+its existing claims. Both steps are best effort: preload failures appear alongside
+the replay summary and never change the backfill/reconcile resource counts or
+errors. Re-run preload after repairing configuration or identity failures.
+
+Every panel path into `workos-only` (directory page, bulk actions, Live state)
+runs preload first and refuses the switch if any live group failed or listing
+coverage is unknown. Groups confirmed `dsync_resource_gone` during the run are
+counted separately and do not block that gate. This does **not** authorize ignoring
+an unresolved deletion event. **Switch without links (emergency override)** is an
+explicit unchecked checkbox: it allows cutover despite failures and logs a warning.
+It can leave group updates/removals/deletions unresolved or halt the listener;
+use it only with an operator recovery plan. Other mode changes and leaving
+`workos-only` are not gated. Bulk actions report each directory's summary and
+refusals; directories that pass can switch even when another is refused.
+
+The preload covers **groups only**. Identity consumers still need their own user
+links; call the resolver while user identities and mappings exist, and retain those
+bindings durably. The group preload records the bridge binding; a standalone
+listener can fetch it on its first later event, including a deletion. The same
+resolver calls can populate a custom consumer's durable cache.
+
+In `DEMO_MODE`, only the designated simulator directory pointing at the bundled
+loopback `/__demo/native/mock-workos/scim/v2` mount skips preload and its gate,
+with a visible `bundled_simulator` summary. Mock events already carry SCIM ids.
+Real imported WorkOS directories remain gated, including when demo mode is on. If neither side recorded a verified association before removal, keep the
 event retryable and recover with verified operator evidence. A native name match
 does not establish ownership. Once confirmed,
 a missing mapped native row stays missing for delete/remove. Do not redirect it

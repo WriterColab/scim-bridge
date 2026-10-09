@@ -1,15 +1,18 @@
+import { panelEventLinkOptions, setPanelDirectoryMode } from "./event-link-cutover";
+import { EventLinkResult, SwitchWithoutLinks } from "./event-link-result";
+import type { BackfillSummary } from "../../../workers/shared/types";
+import type { GroupEventLinkSummary } from "../../../workers/shared/event-link-preload";
 import type { Route } from "./+types/live";
 
 import { useEffect, useState } from "react";
 import { Form, useActionData, useLoaderData, useNavigation, useRevalidator } from "react-router";
-import { datastoreContext } from "../../context";
+import { datastoreContext, demoModeContext } from "../../context";
 import type { Directory, ListenerEvent, Mode } from "../../../workers/shared/types";
 import { MODES } from "../../../workers/shared/types";
 import {
   clearNativeDirectory,
   getDirectoryById,
   listDirectories,
-  setDirectoryMode,
   withDatastoreRetry,
 } from "../../../workers/shared/db";
 import { runBackfill } from "../../../workers/shared/backfill";
@@ -316,8 +319,13 @@ export async function action({ context, request }: Route.ActionArgs) {
     if (!MODES.includes(mode as Mode)) {
       return { error: `That mode is not one of ${MODES.join(", ")}.` };
     }
-    await setDirectoryMode(db, directory.id, mode as Mode);
-    return {};
+    return setPanelDirectoryMode(
+      db,
+      directory,
+      mode as Mode,
+      await panelEventLinkOptions(db, directory, context.get(demoModeContext)),
+      form.get("switch_without_links") === "on",
+    );
   }
 
   if (intent === "run-backfill") {
@@ -328,7 +336,11 @@ export async function action({ context, request }: Route.ActionArgs) {
           "writing native, so live writes keep flowing while it replays.",
       };
     }
-    const backfill = await runBackfill(db, directory as Directory);
+    const backfill = await runBackfill(
+      db,
+      directory as Directory,
+      await panelEventLinkOptions(db, directory, context.get(demoModeContext)),
+    );
     return { backfill };
   }
 
@@ -440,7 +452,9 @@ const MODE_COLOR: Record<Mode, "gray" | "blue" | "green" | "amber"> = {
 
 export default function PanelLive() {
   const data = useLoaderData<typeof loader>();
-  const actionData = useActionData() as { error?: string } | undefined;
+  const actionData = useActionData() as
+    | { error?: string; eventLinks?: GroupEventLinkSummary; backfill?: BackfillSummary }
+    | undefined;
   const revalidator = useRevalidator();
   const navigation = useNavigation();
   const [live, setLive] = useState(true);
@@ -541,6 +555,25 @@ export default function PanelLive() {
         </Callout.Root>
       )}
 
+      {actionData?.eventLinks && <EventLinkResult summary={actionData.eventLinks} />}
+      {actionData?.backfill && (
+        <Flex direction="column" gap="2">
+          <Text size="2">
+            Backfill: {actionData.backfill.users.mirrored} users and{" "}
+            {actionData.backfill.groups.mirrored} groups mirrored;{" "}
+            {actionData.backfill.users.failed + actionData.backfill.groups.failed} failed.
+          </Text>
+          {actionData.backfill.errors.map((error, index) => (
+            <Text key={index} color="red" size="2">
+              {error}
+            </Text>
+          ))}
+          {actionData.backfill.eventLinks && (
+            <EventLinkResult summary={actionData.backfill.eventLinks} />
+          )}
+        </Flex>
+      )}
+
       <Card size="3">
         <Flex direction="column" gap="4">
           <FlowRail mode={mode} counts={counts} />
@@ -553,6 +586,7 @@ export default function PanelLive() {
                 <input name="directoryId" type="hidden" value={directory.id} />
                 <input name="intent" type="hidden" value="set-mode" />
                 <input name="mode" type="hidden" value={m} />
+                {m === "workos-only" && mode !== "workos-only" && <SwitchWithoutLinks />}
                 <Button
                   color={MODE_COLOR[m]}
                   disabled={m === mode || settingMode}
