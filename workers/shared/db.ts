@@ -800,7 +800,9 @@ export async function clearReplayedDivergences(
  *  sweep-laundering primitive. The stamp writers stay consistent with this:
  *  `recordNativeWriteFailure` re-NULLs a row's token on a live failure, correctly
  *  re-opening it to the next run's window, and `clearReplayedDivergenceForResource`
- *  deletes a repaired row rather than leaving a stamp behind to be re-taken. */
+ *  deletes a repaired row rather than leaving a stamp behind to be re-taken.
+ *  Finished runs release surviving stamps via `releaseDivergenceSweepStamps`,
+ *  so a dirty run cannot strand rows outside every later sweep window. */
 export async function markDivergencesForSweep(
   db: Datastore,
   directoryId: string,
@@ -813,6 +815,28 @@ export async function markDivergencesForSweep(
           "AND sweep_token IS NULL",
       )
       .bind(sweepToken, directoryId)
+      .run(),
+  );
+}
+
+/** Release only the finished reconcile's surviving stamps, even after a throw.
+ *  Removing a stamp only prevents a delete: all reconcile clears require their
+ *  own token. A superseded run cannot release its successor's stamps, and live
+ *  failures already carry NULL. Await this after the clean-path sweep and before
+ *  handing back the run's claims so cleanup cannot unstamp rows still needed by
+ *  that sweep or captured by a later run. */
+export async function releaseDivergenceSweepStamps(
+  db: Datastore,
+  directoryId: string,
+  sweepToken: string,
+): Promise<void> {
+  await withDatastoreRetry(() =>
+    db
+      .prepare(
+        "UPDATE native_write_failures SET sweep_token = NULL WHERE directory_id = ? " +
+          "AND sweep_token = ?",
+      )
+      .bind(directoryId, sweepToken)
       .run(),
   );
 }

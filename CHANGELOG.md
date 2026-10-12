@@ -26,6 +26,11 @@ Container images for each version:
 
 ### Fixed
 
+- Release divergence sweep stamps after every Reconcile from WorkOS, including
+  partial failures and exceptions, so unresolved rows can be repaired by a later
+  run. Upgrade clears stamps left by older runs. **After upgrading, run Reconcile
+  once**: stuck rows clear when their resource replays successfully; DELETE gaps
+  remain until native deprovisioning is confirmed.
 - Learn migrated group event bindings after WorkOS SCIM loses `externalId`,
   requiring authenticated current Directory Sync identity, matching SCIM id
   and name, absent external ids, and a complete unique name listing. Existing

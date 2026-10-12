@@ -12,6 +12,7 @@ import {
   insertProxyLog,
   listOtherMappingsByNativeId,
   markDivergencesForSweep,
+  releaseDivergenceSweepStamps,
   releaseReconcileRun,
   releaseWorkosPrimaryCreate,
   shouldPersistLogs,
@@ -429,97 +430,106 @@ async function reconcileFromWorkos(
   // survive — that is the race variant of the sweep hazard — including when it
   // lands on a key the reconcile had already repaired and cleared.
   const sweepToken = crypto.randomUUID();
-  await markDivergencesForSweep(db, directory.id, sweepToken);
+  try {
+    await markDivergencesForSweep(db, directory.id, sweepToken);
 
-  const users = await snapshot(
-    directory.workos_url,
-    directory.workos_token,
-    "Users",
-    "workos",
-    summary.errors,
-  );
-  for (const resource of users.resources) {
-    await pushToNative(
-      db,
-      directory,
+    const users = await snapshot(
+      directory.workos_url,
+      directory.workos_token,
       "Users",
-      resource,
-      summary.users,
+      "workos",
       summary.errors,
-      sweepToken,
-      state,
     );
-  }
+    for (const resource of users.resources) {
+      await pushToNative(
+        db,
+        directory,
+        "Users",
+        resource,
+        summary.users,
+        summary.errors,
+        sweepToken,
+        state,
+      );
+    }
 
-  const groups = await snapshot(
-    directory.workos_url,
-    directory.workos_token,
-    "Groups",
-    "workos",
-    summary.errors,
-  );
-  for (const resource of groups.resources) {
-    const body = { ...resource };
-    let unresolvedMember = false;
-    if (Array.isArray(body.members)) {
-      const members: unknown[] = [];
-      for (const member of body.members) {
-        const workosId = isRecord(member) && typeof member.value === "string" ? member.value : null;
-        const mapping = workosId
-          ? await getMappingByWorkosId(db, directory.id, "Users", workosId)
-          : null;
-        if (!mapping) {
-          unresolvedMember = true;
-          pushError(
-            summary.errors,
-            `Groups/${String(resource.id ?? "unknown")}: member ${workosId ?? "without an id"} ` +
-              "has no confirmed native user mapping; group replay skipped.",
-          );
-          break;
-        }
-        members.push({ ...(member as Record<string, unknown>), value: mapping.native_id });
-      }
-      body.members = members;
-    }
-    if (unresolvedMember) {
-      summary.groups.total += 1;
-      summary.groups.failed += 1;
-      continue;
-    }
-    await pushToNative(
-      db,
-      directory,
+    const groups = await snapshot(
+      directory.workos_url,
+      directory.workos_token,
       "Groups",
-      body,
-      summary.groups,
+      "workos",
       summary.errors,
-      sweepToken,
-      state,
     );
-  }
+    for (const resource of groups.resources) {
+      const body = { ...resource };
+      let unresolvedMember = false;
+      if (Array.isArray(body.members)) {
+        const members: unknown[] = [];
+        for (const member of body.members) {
+          const workosId =
+            isRecord(member) && typeof member.value === "string" ? member.value : null;
+          const mapping = workosId
+            ? await getMappingByWorkosId(db, directory.id, "Users", workosId)
+            : null;
+          if (!mapping) {
+            unresolvedMember = true;
+            pushError(
+              summary.errors,
+              `Groups/${String(resource.id ?? "unknown")}: member ${workosId ?? "without an id"} ` +
+                "has no confirmed native user mapping; group replay skipped.",
+            );
+            break;
+          }
+          members.push({ ...(member as Record<string, unknown>), value: mapping.native_id });
+        }
+        body.members = members;
+      }
+      if (unresolvedMember) {
+        summary.groups.total += 1;
+        summary.groups.failed += 1;
+        continue;
+      }
+      await pushToNative(
+        db,
+        directory,
+        "Groups",
+        body,
+        summary.groups,
+        summary.errors,
+        sweepToken,
+        state,
+      );
+    }
 
-  // The reconcile replayed every WorkOS resource into native without a failure, so
-  // native is not missing anything WorkOS still holds. Rows keyed on a create that
-  // never reached native are cleared here rather than per resource, because a
-  // create failure is keyed on what the IdP addressed it by and WorkOS's snapshot
-  // no longer knows that key. The clear is bounded to the rows that predate this
-  // reconcile and excludes DELETE gaps: a PUT-only replay proves native holds
-  // everything WorkOS holds (additive) but never that native dropped what WorkOS
-  // deleted (subtractive), so a DELETE row stands until a real native-side
-  // deprovision closes it — see clearReplayedDivergences.
-  //
-  // Both snapshots have to be COMPLETE, not merely free of replay failures. A
-  // snapshot that gave up — WorkOS down, a non-SCIM body, pagination ending short
-  // — replays nothing and fails nothing, so counting failures alone would read a
-  // WorkOS outage as proof of parity and wipe the operator's only record of what
-  // native is missing. A partial reconcile clears nothing extra: the rows it did
-  // repair went one at a time above, and the rest are still true.
-  const replayed = summary.users.failed === 0 && summary.groups.failed === 0;
-  if (replayed && users.complete && groups.complete) {
-    await clearReplayedDivergences(db, directory.id, sweepToken);
-  }
+    // The reconcile replayed every WorkOS resource into native without a failure, so
+    // native is not missing anything WorkOS still holds. Rows keyed on a create that
+    // never reached native are cleared here rather than per resource, because a
+    // create failure is keyed on what the IdP addressed it by and WorkOS's snapshot
+    // no longer knows that key. The clear is bounded to the rows that predate this
+    // reconcile and excludes DELETE gaps: a PUT-only replay proves native holds
+    // everything WorkOS holds (additive) but never that native dropped what WorkOS
+    // deleted (subtractive), so a DELETE row stands until a real native-side
+    // deprovision closes it — see clearReplayedDivergences.
+    //
+    // Both snapshots have to be COMPLETE, not merely free of replay failures. A
+    // snapshot that gave up — WorkOS down, a non-SCIM body, pagination ending short
+    // — replays nothing and fails nothing, so counting failures alone would read a
+    // WorkOS outage as proof of parity and wipe the operator's only record of what
+    // native is missing. A partial reconcile clears nothing extra: the rows it did
+    // repair went one at a time above, and the rest are still true.
+    const replayed = summary.users.failed === 0 && summary.groups.failed === 0;
+    if (replayed && users.complete && groups.complete) {
+      await clearReplayedDivergences(db, directory.id, sweepToken);
+    }
 
-  return summary;
+    return summary;
+  } finally {
+    // Await the clean-path delete before releasing any surviving stamps. Clearing
+    // a stamp only prevents this run (or an overlapping run) from deleting a row;
+    // it never makes one clearable. Dirty and thrown runs must release ownership
+    // so a later snapshot can capture and repair their still-diverged resources.
+    await releaseDivergenceSweepStamps(db, directory.id, sweepToken);
+  }
 }
 
 /** A resource the reconcile just wrote into native is no longer missing from it,
