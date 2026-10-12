@@ -78,6 +78,9 @@ export interface AppConfig {
    *  mutations — for scripting the panel from another origin. Off by default,
    *  and mirrors `panelAuthDisabled`: consent, logged loudly at boot. */
   panelCsrfDisabled: boolean;
+  /** Take the request scheme from `X-Forwarded-Proto` (https only). Set it only when
+   *  every request reaches the container through a TLS-terminating proxy you run. */
+  trustProxy: boolean;
   /** `native-app` role: bearer token the bridge presents to this app's /scim/v2. */
   nativeScimToken: string | null;
   /** `native-app` role: HMAC secret of the WorkOS webhook endpoint feeding /webhooks/dsync. */
@@ -209,6 +212,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const panelAuthPassword = env.PANEL_AUTH_PASSWORD || null;
   const panelAuthDisabled = bool(env.PANEL_AUTH_DISABLED);
   const panelCsrfDisabled = bool(env.PANEL_CSRF_DISABLED);
+  const trustProxy = bool(env.TRUST_PROXY);
   // Refuse to boot rather than serve the panel to anyone who can reach the port.
   //
   // /panel is not a dashboard of read-only status: the directory page renders
@@ -259,6 +263,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     panelAuthPassword,
     panelAuthDisabled,
     panelCsrfDisabled,
+    trustProxy,
     nativeScimToken: env.NATIVE_SCIM_TOKEN?.trim() || null,
     webhookSecret,
     bridgeStatusUrl: bridgeStatusUrl ? trimTrailingSlash(bridgeStatusUrl) : null,

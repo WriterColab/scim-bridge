@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # ---- build stage -------------------------------------------------------------
-FROM node:26-bookworm-slim AS builder
+FROM node:26.11.1-bookworm-slim AS builder
 WORKDIR /app
 
 # Toolchain for better-sqlite3's native addon (used only if no prebuilt binary
@@ -48,7 +48,7 @@ COPY . .
 RUN --network=none npm_config_nodedir=/usr/local npm rebuild && npm run build && npm prune --omit=dev
 
 # ---- runtime stage -----------------------------------------------------------
-FROM node:26-bookworm-slim AS runtime
+FROM node:26.11.1-bookworm-slim AS runtime
 ENV NODE_ENV=production \
     PORT=8080 \
     DATABASE_PATH=/data/scim-bridge.db

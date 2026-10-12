@@ -25,6 +25,14 @@ at every boot while it is off, the same as `PANEL_AUTH_DISABLED`. The
 token-authenticated `/scim` and `/status` endpoints are unaffected — the IdP
 posts to them cross-origin legitimately.
 
+Behind a TLS-terminating reverse proxy (ingress, load balancer, Tailscale) the
+bridge receives plain HTTP while the browser uses HTTPS, and React Router refuses
+every panel action from that mismatch with 400. Set `TRUST_PROXY=true` there: the
+bridge then takes the scheme from the proxy's `X-Forwarded-Proto` (only `https`,
+only for the request's own `Host`) when the request arrives, and logs
+`TRUST_PROXY on` at boot. Leave it off when clients can reach the container
+directly, since they could then send the header themselves.
+
 ## Durable storage
 
 The database holds every directory's configuration, its migration mode, **and its

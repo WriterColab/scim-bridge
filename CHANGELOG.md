@@ -13,6 +13,17 @@ Container images for each version:
 
 ## [Unreleased]
 
+### Changed
+
+- **`TRUST_PROXY`** (default off) takes the request scheme from the proxy's
+  `X-Forwarded-Proto: https` when the request arrives. It replaces the panel's
+  late request rebuild (`withOriginScheme`), which answered 500 "Illegal
+  invocation" for every panel action behind a TLS terminator on Node 26.11.
+  **Deployments behind a TLS terminator must set `TRUST_PROXY=true`**, or panel
+  actions answer 400.
+- The image pins its Node.js base to an exact version (`26.11.1`), so a rebuild
+  no longer picks up a new runtime unannounced.
+
 ### Fixed
 
 - Learn migrated group event bindings after WorkOS SCIM loses `externalId`,
