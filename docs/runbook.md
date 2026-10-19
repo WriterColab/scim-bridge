@@ -438,6 +438,11 @@ it stayed caught up, run **Reconcile from WorkOS** on the directory page first â
 it snapshots the live WorkOS directory and replays every resource back into
 native. Verify that every resource succeeded before you flip the mode back.
 
+For resources created after cutover, configure Identity's native-ID callback and
+follow [Identity confirmations and rollback](identity-callback.md). Pending
+aliases block rollback. Pause provisioning and drain Identity events before the
+final reconciliation; a later proxy write invalidates that verification.
+
 Two properties are required before rollback:
 
 - **Durable native mappings.** Modern events resolve existing native rows through

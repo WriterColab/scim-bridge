@@ -1,12 +1,18 @@
-import { getDirectoryByToken } from "../shared/db";
+import { handleEventCallback, eventWorkosResource, pendingEventResponse } from "./event-callback";
+import { listIdpAliases } from "../shared/idp-aliases";
+import { getDirectoryByToken, getMappingByWorkosId } from "../shared/db";
 import { authorizationToken } from "../shared/scim";
 import {
   AmbiguousScimMappingError,
   EventMappingError,
   getUniqueScimMapping,
   learnEventLink,
+  eventMappingStore,
+  verifyDsyncEventIdentity,
+  verifiedWorkosEventMapping,
   MissingEventIdentityError,
 } from "../shared/event-mapping";
+import { bindEventLink, getEventLink } from "../shared/event-links";
 import { nativeIsAuthoritative, type Directory, type PocEnv } from "../shared/types";
 
 export const STATUS_PREFIX = "/status/directories";
@@ -61,7 +67,7 @@ export function appliesDsyncEvents(mode: Directory["mode"]): boolean {
  * webhook events carry in `event.data.directory_id`.
  */
 export async function handleStatus(request: Request, env: PocEnv, url: URL): Promise<Response> {
-  if (request.method !== "GET" && request.method !== "HEAD") {
+  if (request.method !== "GET" && request.method !== "HEAD" && request.method !== "POST") {
     return statusError(405, "The status endpoint only accepts GET.");
   }
 
@@ -69,6 +75,8 @@ export async function handleStatus(request: Request, env: PocEnv, url: URL): Pro
   const segments = rest.split("/").filter(Boolean);
   const mappingRoute = segments.length === 4 && segments[1] === "mappings";
   const eventMappingRoute = segments.length === 3 && segments[1] === "event-mapping";
+  if (request.method === "POST" && !eventMappingRoute)
+    return statusError(405, "Only event-mapping accepts POST.");
   if (segments.length !== 1 && !mappingRoute && !eventMappingRoute) {
     return statusError(404, `Nothing is served at ${url.pathname}. Try ${STATUS_PREFIX}/{id}.`);
   }
@@ -101,6 +109,7 @@ export async function handleStatus(request: Request, env: PocEnv, url: URL): Pro
   if (eventMappingRoute) {
     const kind = segments[2];
     if (kind !== "Users" && kind !== "Groups") return statusError(404, "Unknown resource type.");
+    if (request.method === "POST") return handleEventCallback(request, env, directory, kind);
     const name = url.searchParams.get(kind === "Users" ? "userName" : "displayName");
     const idpId = url.searchParams.get("idp_id");
     const externalId = url.searchParams.get("externalId");
@@ -114,13 +123,54 @@ export async function handleStatus(request: Request, env: PocEnv, url: URL): Pro
         [kind === "Users" ? "username" : "name"]: name,
         ...(externalId ? { raw_attributes: { externalId } } : {}),
       };
-      const { mapping } = await learnEventLink(
-        env.DB,
-        directory,
-        kind,
-        identity,
-        env.WORKOS_API_KEY,
-        url.searchParams.get("existing_only") === "1",
+      const linked = await eventMappingStore(() =>
+        getEventLink(env.DB, directory.id, kind, dsyncId),
+      );
+      if (linked) return mappingResponse(directory, kind, linked, dsyncId);
+      const existingOnly = url.searchParams.get("existing_only") === "1";
+      if (existingOnly) throw new EventMappingError("no_link");
+      if (!idpId || !name) throw new MissingEventIdentityError();
+      const aliases = await eventMappingStore(() => listIdpAliases(env.DB, directory.id));
+      if (!aliases.some((alias) => alias.resource_type === kind && !alias.deleted)) {
+        const { mapping } = await learnEventLink(
+          env.DB,
+          directory,
+          kind,
+          identity,
+          env.WORKOS_API_KEY,
+        );
+        return mappingResponse(directory, kind, mapping, dsyncId);
+      }
+      const current = await verifyDsyncEventIdentity(directory, kind, identity, env.WORKOS_API_KEY);
+      const hasExternalAlias = aliases.some(
+        (alias) =>
+          alias.resource_type === kind &&
+          !alias.deleted &&
+          alias.external_id &&
+          alias.external_id === (externalId || idpId),
+      );
+      let mapping = hasExternalAlias
+        ? null
+        : await verifiedWorkosEventMapping(env.DB, directory, kind, identity, current);
+      if (!mapping) {
+        const resource = await eventWorkosResource(directory, kind, identity, aliases, current);
+        const alias = aliases.find(
+          (a) => a.resource_type === kind && a.workos_id === resource.id && !a.deleted,
+        );
+        if (alias && !alias.native_id) return pendingEventResponse(directory, kind, dsyncId, alias);
+        mapping = await eventMappingStore(() =>
+          getMappingByWorkosId(env.DB, directory.id, kind, resource.id as string),
+        );
+      }
+      if (!mapping) throw new EventMappingError("identity_unconfirmed");
+      await eventMappingStore(() =>
+        bindEventLink(env.DB, {
+          directory_id: directory.id,
+          resource_type: kind,
+          dsync_id: dsyncId,
+          native_id: mapping.native_id,
+          workos_id: mapping.workos_id,
+        }),
       );
       return mappingResponse(directory, kind, mapping, dsyncId);
     } catch (error) {

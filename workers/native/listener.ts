@@ -6,10 +6,21 @@ import {
   withDatastoreRetry,
 } from "../shared/db";
 import { timingSafeEqual } from "../shared/crypto";
-import { eventName, idForNewEventResource, nativeIdForEvent } from "../shared/event-mapping";
+import {
+  eventName,
+  idForNewEventResource,
+  matchesEventIdentity,
+  nativeIdForEvent,
+} from "../shared/event-mapping";
 import { getEventLink } from "../shared/event-links";
-import { fetchDirectoryStatus, fetchEventNativeId } from "./status-client";
-import type { ReceivedDirectoryStatus } from "./status-client";
+import { fetchDirectoryStatus, fetchEventMapping } from "./status-client";
+import type { PendingEventIdentity, ReceivedDirectoryStatus } from "./status-client";
+import {
+  admitPendingIdentity,
+  clearPendingRecord,
+  confirmPendingIdentity,
+  getPendingRecord,
+} from "./pending-identity";
 import { NATIVE_TABLES, ScimStore } from "./store";
 import type { GroupRow, ScimResource, UserRow } from "./store";
 import type { Datastore } from "../shared/datastore";
@@ -30,6 +41,9 @@ type Json = Record<string, unknown>;
 const SIGNATURE_TOLERANCE_MS = 5 * 60 * 1000;
 
 type SignatureResult = "valid" | "invalid" | "stale";
+
+/** Pending bridge identities an event resolved to, confirmed once its write lands. */
+type PendingIdentities = { directory: Directory; pending: PendingEventIdentity }[];
 
 interface Outcome {
   action: "applied" | "skipped" | "ignored";
@@ -223,7 +237,16 @@ async function dispatch(
       idpId: asString(data.idp_id),
     };
   }
-  const outcome = await applyEvent(db, store, eventType, data, eventAt, directoryId);
+  const pending: PendingIdentities = [];
+  const outcome = await applyEvent(db, store, eventType, data, eventAt, directoryId, pending);
+  // Confirmation follows the native write and precedes the ledger, so a failed
+  // callback is a handler error and the redelivery repeats it — even when the
+  // retry finds the row already present and the write itself is a no-op.
+  for (const entry of pending) {
+    const { kind, native_id: nativeId } = entry.pending;
+    const row = kind === "Users" ? await store.userById(nativeId) : await store.groupById(nativeId);
+    if (row) await confirmPendingIdentity(db, entry.directory, entry.pending);
+  }
   for (const scope of scopes) await recordEventVersion(db, scope, eventAt);
   return outcome;
 }
@@ -326,22 +349,23 @@ async function applyEvent(
   data: Json,
   eventAt: string | null,
   directoryId: string,
+  pending: PendingIdentities,
 ): Promise<Outcome> {
   switch (eventType) {
     case "dsync.user.created":
     case "dsync.user.updated":
-      return upsertUserFromEvent(db, store, data, directoryId);
+      return upsertUserFromEvent(db, store, data, directoryId, pending);
     case "dsync.user.deleted":
       return deleteUserFromEvent(db, store, data, directoryId);
     case "dsync.group.created":
     case "dsync.group.updated":
-      return upsertGroupFromEvent(db, store, data, directoryId);
+      return upsertGroupFromEvent(db, store, data, directoryId, pending);
     case "dsync.group.deleted":
       return deleteGroupFromEvent(db, store, data, directoryId);
     case "dsync.group.user_added":
-      return changeMembership(db, store, data, "add", eventAt, directoryId);
+      return changeMembership(db, store, data, "add", eventAt, directoryId, pending);
     case "dsync.group.user_removed":
-      return changeMembership(db, store, data, "remove", eventAt, directoryId);
+      return changeMembership(db, store, data, "remove", eventAt, directoryId, pending);
     case "dsync.activated":
       return { action: "ignored", detail: "directory activated; informational, no per-user work" };
     case "dsync.deleted":
@@ -362,26 +386,37 @@ async function upsertUserFromEvent(
   store: ScimStore,
   data: Json,
   directoryId: string,
+  pending: PendingIdentities,
 ): Promise<Outcome> {
   const idpId = asString(data.idp_id);
   if (!idpId) return { action: "ignored", detail: "user event carries no idp_id" };
   const userName = userNameFromEvent(data) ?? idpId;
   const active = data.state === "active";
 
-  const nativeId = await resolveNativeEventId(db, store, directoryId, "Users", data, !active);
+  const nativeId = await resolveNativeEventId(
+    db,
+    store,
+    directoryId,
+    "Users",
+    data,
+    !active,
+    pending,
+    true,
+  );
   const existing = await findUser(store, idpId, userName, nativeId);
+  const externalId = storedExternalId(pending, "Users", nativeId, data, idpId);
   if (!existing) {
     // A confirmed SCIM mapping preserves the native id. Directory Sync data.id
     // has its own namespace and must never become an unconfirmed native id.
     const id = idForNewEventResource(data, nativeId, idpId);
-    const resource = userResourceFromEvent(id, idpId, userName, active, data, {});
-    await store.upsertUser({ id, userName, externalId: idpId, active, resource });
+    const resource = userResourceFromEvent(id, externalId, userName, active, data, {});
+    await store.upsertUser({ id, userName, externalId, active, resource });
     return { action: "applied", detail: active ? "onboard()" : "provisioned inactive", idpId };
   }
 
   const resource = userResourceFromEvent(
     existing.id,
-    idpId,
+    externalId,
     userName,
     active,
     data,
@@ -391,7 +426,7 @@ async function upsertUserFromEvent(
   const unchanged =
     wasActive === active &&
     existing.user_name === userName &&
-    existing.external_id === idpId &&
+    existing.external_id === externalId &&
     JSON.stringify(resource) === existing.resource;
   if (unchanged) return { action: "skipped", detail: "no transition", idpId };
 
@@ -406,12 +441,12 @@ async function upsertUserFromEvent(
   // by this user's own membership event, and clearing it would erase the very
   // edge that created it.
   let membershipNote = "";
-  if (existing.external_id !== null && existing.external_id !== idpId) {
+  if (existing.external_id !== null && existing.external_id !== externalId) {
     await store.clearMemberships(existing.id);
     membershipNote = "; inherited memberships cleared";
   }
 
-  await store.upsertUser({ id: existing.id, userName, externalId: idpId, active, resource });
+  await store.upsertUser({ id: existing.id, userName, externalId, active, resource });
   const detail =
     !wasActive && active ? "onboard()" : wasActive && !active ? "offboard()" : "attributes updated";
   return { action: "applied", detail: detail + membershipNote, idpId };
@@ -490,35 +525,45 @@ async function upsertGroupFromEvent(
   store: ScimStore,
   data: Json,
   directoryId: string,
+  pending: PendingIdentities,
 ): Promise<Outcome> {
   // Retain the external identity separately from the mapped native SCIM id.
   const idpId = groupKeyFromEvent(data);
   if (!idpId) return { action: "ignored", detail: "group event carries no key" };
   const name = asString(data.name);
 
-  const nativeId = await resolveNativeEventId(db, store, directoryId, "Groups", data);
+  const nativeId = await resolveNativeEventId(
+    db,
+    store,
+    directoryId,
+    "Groups",
+    data,
+    false,
+    pending,
+  );
   const existing = await findGroup(store, idpId, name, nativeId);
+  const externalId = storedExternalId(pending, "Groups", nativeId, data, idpId);
   if (!existing) {
     if (!name) return { action: "ignored", detail: "group event carries no name", idpId };
     // As with users, create only under a confirmed SCIM id or the legacy
     // no-resource-id fallback, never an unresolved Directory Sync id.
     const id = idForNewEventResource(data, nativeId, idpId);
-    const resource = groupResourceFromEvent(id, idpId, name, {});
-    await store.upsertGroup({ id, displayName: name, externalId: idpId, resource });
+    const resource = groupResourceFromEvent(id, externalId, name, {});
+    await store.upsertGroup({ id, displayName: name, externalId, resource });
     return { action: "applied", detail: `group "${name}" created`, idpId };
   }
 
   const displayName = name ?? existing.display_name;
-  if (existing.display_name === displayName && existing.external_id === idpId) {
+  if (existing.display_name === displayName && existing.external_id === externalId) {
     return { action: "skipped", detail: "no transition", idpId };
   }
   const resource = groupResourceFromEvent(
     existing.id,
-    idpId,
+    externalId,
     displayName,
     parseResource(existing.resource),
   );
-  await store.upsertGroup({ id: existing.id, displayName, externalId: idpId, resource });
+  await store.upsertGroup({ id: existing.id, displayName, externalId, resource });
   const detail =
     existing.display_name !== displayName ? `renamed to "${displayName}"` : "attributes updated";
   return { action: "applied", detail, idpId };
@@ -550,6 +595,7 @@ async function changeMembership(
   op: "add" | "remove",
   eventAt: string | null,
   directoryId: string,
+  pending: PendingIdentities,
 ): Promise<Outcome> {
   const userData = asObject(data.user);
   const groupData = asObject(data.group);
@@ -581,6 +627,7 @@ async function changeMembership(
     "Users",
     userData,
     op === "remove",
+    pending,
   );
   const nativeGroupId = await resolveNativeEventId(
     db,
@@ -589,6 +636,7 @@ async function changeMembership(
     "Groups",
     groupData,
     op === "remove",
+    pending,
   );
   const user = await findUser(store, userIdpId, userName, nativeUserId);
   if (!user && op === "remove") {
@@ -639,12 +687,13 @@ async function changeMembership(
     // The same ID contract applies to a partial membership stub.
     userId = newUserId!;
     const active = userData.state === undefined ? true : userData.state === "active";
+    const externalId = storedExternalId(pending, "Users", userId, userData, userIdpId);
     await store.upsertUser({
       id: userId,
       userName,
-      externalId: userIdpId,
+      externalId,
       active,
-      resource: userResourceFromEvent(userId, userIdpId, userName, active, userData, {}),
+      resource: userResourceFromEvent(userId, externalId, userName, active, userData, {}),
     });
     stubs += 1;
     userOnboarded = active;
@@ -656,11 +705,12 @@ async function changeMembership(
     groupId = newGroupId!;
     const displayName = groupName ?? groupIdpId ?? "unknown group";
     groupLabel = displayName;
+    const externalId = storedExternalId(pending, "Groups", groupId, groupData, groupIdpId);
     await store.upsertGroup({
       id: groupId,
       displayName,
-      externalId: groupIdpId,
-      resource: groupResourceFromEvent(groupId, groupIdpId, displayName, {}),
+      externalId,
+      resource: groupResourceFromEvent(groupId, externalId, displayName, {}),
     });
     stubs += 1;
   }
@@ -691,6 +741,10 @@ async function resolveNativeEventId(
   kind: "Users" | "Groups",
   resource: Json,
   allowAbsentMapping = false,
+  pending: PendingIdentities = [],
+  /** This write may create the row, so a still-pending identity is wanted
+   *  even when the event deactivates it (an inactive birth). */
+  mayCreate = false,
 ): Promise<string | null> {
   const nativeResource = async (id: string): Promise<Json | null> => {
     if (kind === "Users") {
@@ -706,7 +760,32 @@ async function resolveNativeEventId(
     remoteMapping: async () => {
       const directory = await getDirectoryById(db, directoryId);
       if (!directory) throw new Error("Event directory no longer exists");
-      return fetchEventNativeId(db, directory, kind, resource, allowAbsentMapping);
+      // Only a delete/remove is limited to existing links: an inactive create or
+      // update with a full identity can still be verified and created pending.
+      // A never-confirmed pending identity cannot be deleted this way — the
+      // bridge answers existing-only lookups with a link or a 503 — so its
+      // delete fails closed and retries until an operator settles the alias.
+      const existingOnly =
+        allowAbsentMapping &&
+        !(mayCreate && eventName(kind, resource) && asString(resource.idp_id));
+      const dsyncId = String(resource.id);
+      const record = await getPendingRecord(db, directory.id, kind, dsyncId);
+      const answer = await fetchEventMapping(db, directory, kind, resource, existingOnly, {
+        expectNativeId: record?.native_id,
+      });
+      if (answer.status === "confirmed") {
+        // The bridge committed an earlier confirmation whose reply was lost.
+        if (record) await clearPendingRecord(db, directory.id, kind, dsyncId);
+        return answer.native_id;
+      }
+      // Pending: the bridge names the public id to create under, but nothing
+      // maps it yet. Use it for this write only; dispatch confirms afterwards.
+      const { recorded } = await admitPendingIdentity(db, directory, answer.pending);
+      const present = await nativeResource(answer.pending.native_id);
+      if (present && !recorded && !matchesEventIdentity(kind, resource, present))
+        throw new Error("Pending identity's native id is held by a different resource");
+      pending.push({ directory, pending: answer.pending });
+      return answer.pending.native_id;
     },
     storedIdentities: async () => {
       const table = kind === "Users" ? NATIVE_TABLES.users : NATIVE_TABLES.groups;
@@ -732,6 +811,25 @@ async function resolveNativeEventId(
       }));
     },
   });
+}
+
+/**
+ * The externalId to store. A row written under a still-pending bridge identity
+ * keeps only the IdP's own SCIM externalId: the bridge confirms the row against
+ * the WorkOS SCIM record, which has none when the IdP sent none, so the usual
+ * idp_id stand-in would make the row unprovable. Everything else is unchanged.
+ */
+function storedExternalId(
+  pending: PendingIdentities,
+  kind: "Users" | "Groups",
+  nativeId: string | null,
+  data: Json,
+  fallback: string | null,
+): string | null {
+  const unconfirmed = pending.some(
+    (entry) => entry.pending.kind === kind && entry.pending.native_id === nativeId,
+  );
+  return unconfirmed ? asString(asObject(data.raw_attributes)?.externalId) : fallback;
 }
 
 async function findUser(

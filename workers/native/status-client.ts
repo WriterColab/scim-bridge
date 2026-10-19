@@ -131,6 +131,30 @@ export async function fetchDirectoryStatus(
   }
 }
 
+/**
+ * The bridge's answer for an event identity. `pending` means the bridge has a
+ * verified public SCIM identity (an idp alias) that no native row backs yet:
+ * the listener creates the row under `native_id` — the public id the IdP was
+ * told — and only then confirms it (see ./pending-identity). Nothing here is a
+ * native mapping until that confirmation lands.
+ */
+export type EventMappingAnswer =
+  | { status: "confirmed"; native_id: string }
+  | { status: "pending"; pending: PendingEventIdentity };
+
+export interface PendingEventIdentity {
+  /** The bridge's own directory id — equal to the local one only when this
+   *  listener shares the bridge database. */
+  bridge_directory_id: string;
+  kind: ResourceType;
+  dsync_id: string;
+  workos_scim_id: string;
+  /** The public SCIM id the native row must be created under. */
+  native_id: string;
+  /** The event identity the bridge verified, replayed in the confirmation. */
+  event: Record<string, unknown>;
+}
+
 /** Learn a verified pair without giving a standalone listener WorkOS secrets. */
 export async function fetchEventNativeId(
   db: Datastore,
@@ -139,9 +163,25 @@ export async function fetchEventNativeId(
   resource: Record<string, unknown>,
   existingOnly = false,
 ): Promise<string | null> {
-  const base = (
-    (await getConfig(db, "proxy.loopback_url")) ?? (await getConfig(db, "proxy.public_url"))
-  )?.replace(/\/+$/, "");
+  const answer = await fetchEventMapping(db, directory, kind, resource, existingOnly);
+  if (answer.status === "pending")
+    throw new Error("Event identity is pending native creation; it has no native mapping yet");
+  return answer.native_id;
+}
+
+export async function fetchEventMapping(
+  db: Datastore,
+  directory: Directory,
+  kind: ResourceType,
+  resource: Record<string, unknown>,
+  existingOnly = false,
+  options: {
+    /** The row a previous attempt created for a pending answer. A confirmed
+     *  answer naming any other native id fails closed before it is learned. */
+    expectNativeId?: string;
+  } = {},
+): Promise<EventMappingAnswer> {
+  const base = await bridgeBase(db);
   const token = await clientTokenFor(db, directory.id);
   if (!base || !token) throw new Error("Event has no authenticated bridge mapping resolver");
   const name = eventName(kind, resource);
@@ -156,17 +196,42 @@ export async function fetchEventNativeId(
   const raw = isRecord(resource.raw_attributes) ? resource.raw_attributes : {};
   if (existingOnly) query.set("existing_only", "1");
   if (typeof raw.externalId === "string" && raw.externalId) query.set("externalId", raw.externalId);
-  const response = await fetch(
-    `${base}/status/directories/${encodeURIComponent(directory.id)}/event-mapping/${kind}?${query}`,
-    {
-      headers: { Authorization: `Bearer ${token}` },
-      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-    },
-  );
+  const response = await fetch(`${eventMappingUrl(base, directory, kind)}?${query}`, {
+    headers: { Authorization: `Bearer ${token}` },
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+  });
   if (!response.ok) throw new Error(`Bridge event mapping resolver returned ${response.status}`);
   const mapping: unknown = await response.json();
   if (
+    isRecord(mapping) &&
+    mapping.status === "pending" &&
+    !existingOnly &&
+    mapping.native_id === undefined &&
+    mapping.workos_directory_id === directory.workos_directory_id &&
+    mapping.resource_type === kind &&
+    typeof mapping.dsync_id === "string" &&
+    mapping.dsync_id === resource.id &&
+    typeof mapping.directory_id === "string" &&
+    mapping.directory_id &&
+    typeof mapping.workos_scim_id === "string" &&
+    mapping.workos_scim_id &&
+    typeof mapping.idp_id === "string" &&
+    mapping.idp_id
+  )
+    return {
+      status: "pending",
+      pending: {
+        bridge_directory_id: mapping.directory_id,
+        kind,
+        dsync_id: mapping.dsync_id,
+        workos_scim_id: mapping.workos_scim_id,
+        native_id: mapping.idp_id,
+        event: resource,
+      },
+    };
+  if (
     !isRecord(mapping) ||
+    mapping.status !== undefined ||
     mapping.workos_directory_id !== directory.workos_directory_id ||
     mapping.resource_type !== kind ||
     mapping.dsync_id !== resource.id ||
@@ -179,32 +244,68 @@ export async function fetchEventNativeId(
       mapping.strategy !== "fallback-post")
   )
     throw new Error("Bridge returned an invalid event mapping");
-  // The remote bridge id differs from this listener's local directory id. Never
-  // overwrite an existing local association when learning the verified pair.
+  if (options.expectNativeId !== undefined && options.expectNativeId !== mapping.native_id)
+    throw new Error(
+      "Bridge confirmed a different native row than this listener created; operator recovery is required",
+    );
+  await learnVerifiedPair(db, directory, kind, {
+    dsync_id: String(resource.id),
+    native_id: mapping.native_id,
+    workos_id: mapping.workos_scim_id,
+    // A pair this listener created and the bridge then bound is a live
+    // mapping even when the bridge answers from its event link alone.
+    strategy:
+      (mapping.strategy as "migrated-id" | "fallback-post" | undefined) ??
+      (options.expectNativeId === undefined
+        ? undefined
+        : mapping.native_id === mapping.workos_scim_id
+          ? "migrated-id"
+          : "fallback-post"),
+  });
+  return { status: "confirmed", native_id: mapping.native_id };
+}
+
+/**
+ * Persist a pair the bridge vouched for. The remote bridge id differs from
+ * this listener's local directory id, so never overwrite an existing local
+ * association when learning it. Without a strategy only the event link is
+ * kept (an existing link the bridge resolved without a live mapping).
+ */
+export async function learnVerifiedPair(
+  db: Datastore,
+  directory: Directory,
+  kind: ResourceType,
+  pair: {
+    dsync_id: string;
+    native_id: string;
+    workos_id: string;
+    strategy?: "migrated-id" | "fallback-post";
+  },
+): Promise<void> {
   const readOwners = () =>
     withDatastoreRetry(() =>
       db
         .prepare(
           "SELECT native_id FROM id_mappings WHERE directory_id = ? AND resource_type = ? AND workos_id = ? LIMIT 2",
         )
-        .bind(directory.id, kind, mapping.workos_scim_id)
+        .bind(directory.id, kind, pair.workos_id)
         .all<{ native_id: string }>(),
     );
-  const previous = await getMapping(db, directory.id, kind, mapping.native_id);
+  const previous = await getMapping(db, directory.id, kind, pair.native_id);
   const previousOwners = (await readOwners()).results;
   if (
-    (previous && previous.workos_id !== mapping.workos_scim_id) ||
-    previousOwners.some((owner) => owner.native_id !== mapping.native_id)
+    (previous && previous.workos_id !== pair.workos_id) ||
+    previousOwners.some((owner) => owner.native_id !== pair.native_id)
   )
     throw new Error("Verified bridge identity conflicts with an existing local mapping");
   await bindEventLink(db, {
     directory_id: directory.id,
     resource_type: kind,
-    dsync_id: String(resource.id),
-    native_id: mapping.native_id,
-    workos_id: mapping.workos_scim_id,
+    dsync_id: pair.dsync_id,
+    native_id: pair.native_id,
+    workos_id: pair.workos_id,
   });
-  if (!mapping.strategy) return mapping.native_id;
+  if (!pair.strategy) return;
   await withDatastoreRetry(() =>
     db
       .prepare(
@@ -216,27 +317,39 @@ export async function fetchEventNativeId(
       .bind(
         directory.id,
         kind,
-        mapping.native_id,
-        mapping.workos_scim_id,
-        mapping.strategy,
+        pair.native_id,
+        pair.workos_id,
+        pair.strategy,
         directory.id,
         kind,
-        mapping.native_id,
-        mapping.workos_scim_id,
-        mapping.workos_scim_id,
-        mapping.native_id,
+        pair.native_id,
+        pair.workos_id,
+        pair.workos_id,
+        pair.native_id,
       )
       .run(),
   );
-  const byNative = await getMapping(db, directory.id, kind, mapping.native_id);
+  const byNative = await getMapping(db, directory.id, kind, pair.native_id);
   const owners = (await readOwners()).results;
   if (
-    byNative?.workos_id !== mapping.workos_scim_id ||
+    byNative?.workos_id !== pair.workos_id ||
     owners.length !== 1 ||
-    owners[0].native_id !== mapping.native_id
+    owners[0].native_id !== pair.native_id
   )
     throw new Error("Verified bridge identity conflicts with an existing local mapping");
-  return mapping.native_id;
+}
+
+/** The bridge base the status client dials: loopback in-process, else public. */
+export async function bridgeBase(db: Datastore): Promise<string | null> {
+  return (
+    (
+      (await getConfig(db, "proxy.loopback_url")) ?? (await getConfig(db, "proxy.public_url"))
+    )?.replace(/\/+$/, "") ?? null
+  );
+}
+
+export function eventMappingUrl(base: string, directory: Directory, kind: ResourceType): string {
+  return `${base}/status/directories/${encodeURIComponent(directory.id)}/event-mapping/${kind}`;
 }
 
 /** Whether a cached entry answers this read: inside the TTL, and — when the

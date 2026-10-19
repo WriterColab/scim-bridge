@@ -208,16 +208,17 @@ describe("workos-primary mapped PUT recovery claims", () => {
     expect(await readClaim()).toBeNull();
   });
 
-  it("leaves workos-only recovery outside primary claims", async () => {
+  it("fences workos-only recovery behind the existing create claim", async () => {
     await setDirectoryMode(env.DB, directory.id, "workos-only");
     await claimWorkosPrimaryCreate(env.DB, directory.id, "Users", "existing-create");
     missingWorkos();
     fake.route("workos", "POST", "/Users", scimJson(201, { id: "workos-new" }));
 
-    expect((await send()).status).toBe(200);
+    expect((await send()).status).toBe(503);
     expect(fake.callsTo("native")).toEqual([]);
+    expect(fake.callsTo("workos")).toEqual([]);
     expect(await getMapping(env.DB, directory.id, "Users", "18")).toMatchObject({
-      workos_id: "workos-new",
+      workos_id: "workos-old",
     });
     expect(await readClaim()).toEqual({ token: "existing-create" });
   });
