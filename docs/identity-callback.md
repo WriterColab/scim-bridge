@@ -8,18 +8,21 @@ that a native row exists.
 
 ## Identity integration
 
-Configure the same strong random `SCIM_BRIDGE_CALLBACK_TOKEN` in the bridge and
-Identity. The callback requires both the directory's existing bearer proxy token
-and this separate service credential. On Cloudflare, install it as a Worker
-secret. Keep it out of IdP settings and logs. The bridge also requires its
-`WORKOS_API_KEY` to verify the live Directory Sync resource.
+Identity calls the bridge over the private cluster network. Istio S2S
+AuthorizationPolicy authenticates the workload and permits only Identity to call
+these callback POST routes. The directory's existing bearer proxy token scopes
+and authenticates the directory; no additional callback secret is required.
+Keep `POST /status/directories/*/event-mapping/Users` and `/Groups` off public
+ingress and enforce the Identity-only policy on the private service. Merely using
+a private URL does not enforce caller authorization. Other deployments must
+provide an equivalent authenticated service boundary before enabling callbacks.
+The bridge also requires `WORKOS_API_KEY` to verify the live Directory Sync resource.
 
 After successful or idempotently resolved native creation, Identity sends:
 
 ```http
 POST /status/directories/{directory_id}/event-mapping/Users
 Authorization: Bearer <directory proxy token>
-X-SCIM-Bridge-Callback-Token: <service credential>
 Content-Type: application/json
 
 {
@@ -38,11 +41,11 @@ it is not the Writer resource address. For groups, use `/Groups`, a
 
 The bridge verifies the directory credential, live DSync identity, corresponding
 WorkOS SCIM resource, native GET identity, and existing ownership. Writer users
-may have no native SCIM `externalId`; in that case the separately authenticated
+may have no native SCIM `externalId`; in that case the Istio-authenticated
 Identity assertion supplies the association, corroborated by native ID and name.
 A nonempty mismatching native user externalId is refused. Writer groups use
 their native ID as externalId; the callback also accepts that exact group
-identity representation. The service credential provides explicit directory attribution
+identity representation. The service identity and directory token provide explicit directory attribution
 even when directories share a native URL. Native lookups still use the directory’s
 own token, and conflicting owners are refused. User names may also match a
 verified WorkOS email, since Writer uses email while Okta may use a different login.
@@ -54,7 +57,9 @@ A successful response is `200`, with `directory_id`, `workos_directory_id`,
 `503` with `Retry-After` means confirmation was not completed. Identity must
 retry, including when the preceding native create already succeeded. Do not
 acknowledge an event solely because the native user now exists. A missing or
-incorrect service credential returns `401`.
+incorrect directory bearer token returns `401`; a token for another directory
+cannot address this directory. Istio rejects unauthorized service callers before
+they reach the application.
 
 The GET event-mapping endpoint returns a pending response for a verified live
 alias whose native resource has not yet been confirmed:

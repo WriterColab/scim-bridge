@@ -7,7 +7,6 @@ import { NATIVE_TABLES, ScimStore } from "../workers/native/store";
 import { fetchEventNativeId } from "../workers/native/status-client";
 import { getEventLink } from "../workers/shared/event-links";
 import { getIdpAlias } from "../workers/shared/idp-aliases";
-import { rememberCallbackToken } from "../workers/native/pending-identity";
 import {
   getMappingByWorkosId,
   listDirectories,
@@ -27,7 +26,6 @@ describe("directory-authenticated event identity resolver", () => {
   let fake: FakeUpstreams | undefined;
   afterEach(() => {
     fake?.restore();
-    rememberCallbackToken(null);
   });
 
   async function setup() {
@@ -310,13 +308,11 @@ describe("directory-authenticated event identity resolver", () => {
         Resources: listing,
       }),
     );
-    bridge.SCIM_BRIDGE_CALLBACK_TOKEN = "callback-secret";
     const native = await createEnv();
     const nativeConfig = loadConfig({
       APP_ROLE: "native-app",
       WEBHOOK_SECRET: "secret",
       BRIDGE_STATUS_URL: "https://bridge.test",
-      SCIM_BRIDGE_CALLBACK_TOKEN: "callback-secret",
       DIRECTORIES_JSON: JSON.stringify([
         { workos_directory_id: "directory_resolver", proxy_token: directory.proxy_token },
       ]),
@@ -400,7 +396,7 @@ describe("directory-authenticated event identity resolver", () => {
     expect((await webhook("birth", "dsync.user.created")).status).toBe(200);
     expect(callbacks).toHaveLength(2);
     const callback = callbacks[1];
-    expect(callback.headers.get("X-SCIM-Bridge-Callback-Token")).toBe("callback-secret");
+    expect(callback.headers.has("X-SCIM-Bridge-Callback-Token")).toBe(false);
     expect(callback.headers.get("Authorization")).toBe(`Bearer ${directory.proxy_token}`);
     expect(JSON.parse(callback.body)).toEqual({
       dsync_id: "directory_user_new",

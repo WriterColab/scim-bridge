@@ -30,17 +30,6 @@ export function callbackError(status: number, reason: string, message: string): 
   );
 }
 
-export async function callbackAuthorized(request: Request, expected?: string): Promise<boolean> {
-  const provided = request.headers.get("X-SCIM-Bridge-Callback-Token");
-  if (!expected || !provided) return false;
-  const digest = async (value: string) =>
-    new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value)));
-  const [a, b] = await Promise.all([digest(provided), digest(expected)]);
-  let difference = 0;
-  for (let i = 0; i < a.length; i++) difference |= a[i] ^ b[i];
-  return difference === 0;
-}
-
 /** Both IdP ownership and the live DSync record are checked before using a SCIM row. */
 export async function eventWorkosResource(
   directory: Directory,
@@ -109,12 +98,8 @@ export async function handleEventCallback(
   directory: Directory,
   kind: ResourceType,
 ): Promise<Response> {
-  if (!(await callbackAuthorized(request, env.SCIM_BRIDGE_CALLBACK_TOKEN)))
-    return callbackError(
-      401,
-      "unauthorized_callback",
-      "A valid Identity callback credential is required",
-    );
+  // Istio authenticates and authorizes Identity on this internal route.
+  // The status router has already authenticated the directory bearer token.
   let body: unknown;
   try {
     body = await request.json();

@@ -125,8 +125,6 @@ export interface PocEnv {
   DB: Datastore;
   /** Used only on the bridge to verify a first Directory Sync resource binding. */
   WORKOS_API_KEY?: string;
-  /** Service-only credential, separate from the tenant IdP bearer token. */
-  SCIM_BRIDGE_CALLBACK_TOKEN?: string;
 }
 
 /**

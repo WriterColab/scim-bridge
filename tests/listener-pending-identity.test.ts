@@ -2,7 +2,6 @@ import { afterEach, describe, expect, it } from "vitest";
 import proxyWorker from "../workers/proxy/index";
 import { processDsyncEvent } from "../workers/native/listener";
 import { NATIVE_TABLES, ScimStore } from "../workers/native/store";
-import { rememberCallbackToken } from "../workers/native/pending-identity";
 import { getMappingByWorkosId, setConfig, upsertMapping } from "../workers/shared/db";
 import { getEventLink } from "../workers/shared/event-links";
 import { getIdpAlias } from "../workers/shared/idp-aliases";
@@ -22,7 +21,6 @@ describe("listener confirms pending bridge identities", () => {
   let fake: FakeUpstreams | undefined;
   afterEach(() => {
     fake?.restore();
-    rememberCallbackToken(null);
   });
 
   async function setup(kind: "Users" | "Groups" = "Users") {
@@ -177,7 +175,7 @@ describe("listener confirms pending bridge identities", () => {
     });
   });
 
-  it("keeps a separate-database creation pending until a callback token is configured", async () => {
+  it("keeps a separate-database creation pending when the callback is unavailable", async () => {
     const { env, directory, scimId, event, store } = await setup();
     // A standalone app keys its directory by the WorkOS id and shares nothing
     // with the bridge, so the alias is out of reach: only the callback can bind.
@@ -194,9 +192,15 @@ describe("listener confirms pending bridge identities", () => {
         ]),
       }),
     );
+    const upstream = globalThis.fetch;
+    globalThis.fetch = async (input, init) => {
+      const request = input instanceof Request ? input : new Request(input, init);
+      if (request.method === "POST" && request.url.includes("/event-mapping/"))
+        return Response.json({ error: "unavailable" }, { status: 503 });
+      return upstream(input, init);
+    };
     const nativeStore = new ScimStore(native.DB, NATIVE_TABLES);
     expect((await processDsyncEvent(native.DB, event)).handlerError).toBe(true);
-    expect(await lastDetail(native.DB)).toContain("SCIM_BRIDGE_CALLBACK_TOKEN is required");
     expect(await nativeStore.userById(scimId)).toMatchObject({ user_name: "new@example.com" });
     expect(await pendingRecords(native.DB)).toBe(1);
     expect(await getMappingByWorkosId(native.DB, "directory_pending", "Users", scimId)).toBeNull();
@@ -211,8 +215,6 @@ describe("listener confirms pending bridge identities", () => {
     )
       .bind(JSON.stringify({ native_id: "native-elsewhere", workos_scim_id: scimId }))
       .run();
-    rememberCallbackToken("callback-secret");
-    env.SCIM_BRIDGE_CALLBACK_TOKEN = "callback-secret";
     expect((await processDsyncEvent(native.DB, event)).handlerError).toBe(true);
     expect(await lastDetail(native.DB)).toContain("Pending identity changed");
     expect(await getIdpAlias(env.DB, directory.id, "Users", scimId)).toMatchObject({
@@ -280,8 +282,6 @@ describe("listener confirms pending bridge identities", () => {
 
   it("settles a callback the bridge committed but whose reply was lost", async () => {
     const { env, directory, scimId, event } = await setup();
-    env.SCIM_BRIDGE_CALLBACK_TOKEN = "callback-secret";
-    rememberCallbackToken("callback-secret");
     const { native, store } = await standalone(directory);
     let posts = 0;
     const bridgeFetch = globalThis.fetch;
@@ -312,8 +312,6 @@ describe("listener confirms pending bridge identities", () => {
 
   it("refuses two pending events racing onto one native row", async () => {
     const { env, directory, scimId, event } = await setup();
-    rememberCallbackToken("callback-secret");
-    env.SCIM_BRIDGE_CALLBACK_TOKEN = "callback-secret";
     const { native } = await standalone(directory);
     // Another Directory Sync id recorded the row between admission and record.
     await native.DB.prepare("INSERT INTO poc_config (key, value) VALUES (?, ?)")

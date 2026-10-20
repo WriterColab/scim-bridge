@@ -16,7 +16,6 @@ import {
   storeClientToken,
 } from "../workers/shared/client-tokens";
 import { secretsMatch } from "../workers/shared/crypto";
-import { rememberCallbackToken } from "../workers/native/pending-identity";
 import {
   checkNativeNamespace,
   duplicateNativeNamespaces,
@@ -88,10 +87,6 @@ export interface AppConfig {
   webhookSecret: string | null;
   /** `native-app` role: base URL of the BRIDGE, which serves the status endpoint. */
   bridgeStatusUrl: string | null;
-  /** Shared secret for the bridge's Identity callback (`SCIM_BRIDGE_CALLBACK_TOKEN`).
-   *  The bridge verifies it; a `native-app` listener presents it after creating
-   *  a row for a pending identity. Kept in process, never seeded into the database. */
-  callbackToken: string | null;
   /** WorkOS API key for the Events API polling transport. Environment-wide
    *  credential, so it lives in env only — never seeded into the database. */
   workosApiKey: string | null;
@@ -272,7 +267,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     nativeScimToken: env.NATIVE_SCIM_TOKEN?.trim() || null,
     webhookSecret,
     bridgeStatusUrl: bridgeStatusUrl ? trimTrailingSlash(bridgeStatusUrl) : null,
-    callbackToken: env.SCIM_BRIDGE_CALLBACK_TOKEN?.trim() || null,
     workosApiKey,
     workosEventsUrl,
     eventsPollIntervalMs,
@@ -453,9 +447,6 @@ export async function seedNativeAppConfig(env: PocEnv, config: AppConfig): Promi
     await setConfig(db, "proxy.public_url", config.bridgeStatusUrl);
     await setConfig(db, "proxy.loopback_url", config.bridgeStatusUrl);
   }
-  // Like the directory tokens: env-supplied on every boot, so it stays in memory
-  // rather than becoming a plaintext secret at rest.
-  rememberCallbackToken(config.callbackToken);
   // Real WorkOS delivers the DSync events here, so the bundled mock WorkOS —
   // which rides along inside the native worker at /mock-workos/scim/v2 — must
   // not also emit them if anything ever writes to it.

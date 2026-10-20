@@ -25,7 +25,6 @@ describe("Identity callback and rollback", () => {
   async function setup(fallback = false, nativeUserName?: string) {
     const env = await createEnv();
     env.WORKOS_API_KEY = "api-secret";
-    env.SCIM_BRIDGE_CALLBACK_TOKEN = "identity-secret";
     const directory = await seedDirectory(env.DB, {
       mode: "workos-only",
       workos_directory_id: "directory_one",
@@ -82,7 +81,7 @@ describe("Identity callback and rollback", () => {
       await ctx.drain();
       return response;
     };
-    const callback = (nativeId = "123", secret = "identity-secret") =>
+    const callback = (nativeId = "123", token = directory.proxy_token) =>
       send(
         "POST",
         `/status/directories/${directory.id}/event-mapping/Users`,
@@ -92,7 +91,7 @@ describe("Identity callback and rollback", () => {
           idp_id: "00u-user",
           userName: resource.userName,
         },
-        { "X-SCIM-Bridge-Callback-Token": secret },
+        { Authorization: `Bearer ${token}` },
       );
     const reconcile = async () => {
       fake!.route("workos", "GET", "/Groups", scimJson(200, { totalResults: 0, Resources: [] }));
@@ -119,10 +118,40 @@ describe("Identity callback and rollback", () => {
     expect(fake!.callsTo("native")).toHaveLength(0);
   });
 
-  it("requires the service credential even with a valid directory token", async () => {
+  it("rejects an invalid directory bearer token before verifying resources", async () => {
     const { env, directory, create, callback } = await setup();
     await create();
     expect((await callback("123", "wrong")).status).toBe(401);
+    expect((await listIdpAliases(env.DB, directory.id))[0].native_id).toBeNull();
+    expect(fake!.callsTo("native")).toHaveLength(0);
+  });
+
+  it("does not let another directory token confirm this directory's alias", async () => {
+    const { env, directory, create, callback } = await setup();
+    await create();
+    const other = await seedDirectory(env.DB, { name: "Other directory" });
+    expect((await callback("123", other.proxy_token)).status).toBe(404);
+    expect((await listIdpAliases(env.DB, directory.id))[0].native_id).toBeNull();
+    expect(fake!.callsTo("native")).toHaveLength(0);
+  });
+
+  it("requires the directory bearer token even on the private callback route", async () => {
+    const { env, directory, create } = await setup();
+    await create();
+    const response = await proxy.fetch(
+      new Request(`https://bridge.test/status/directories/${directory.id}/event-mapping/Users`, {
+        method: "POST",
+        body: JSON.stringify({
+          dsync_id: "directory_user_one",
+          native_id: "123",
+          idp_id: "00u-user",
+          userName: "user@example.test",
+        }),
+      }),
+      env,
+      createCtx(),
+    );
+    expect(response.status).toBe(401);
     expect((await listIdpAliases(env.DB, directory.id))[0].native_id).toBeNull();
     expect(fake!.callsTo("native")).toHaveLength(0);
   });
@@ -297,18 +326,13 @@ describe("Identity callback and rollback", () => {
       "/Users/00u-user",
       scimJson(400, { detail: "id should be a number" }),
     );
-    const response = await send(
-      "POST",
-      "/status/directories/directory_one/event-mapping/Users",
-      {
-        dsync_id: "directory_user_one",
-        native_id: "123",
-        idp_id: "00u-user",
-        userName: resource.userName,
-        repair_legacy: true,
-      },
-      { "X-SCIM-Bridge-Callback-Token": "identity-secret" },
-    );
+    const response = await send("POST", "/status/directories/directory_one/event-mapping/Users", {
+      dsync_id: "directory_user_one",
+      native_id: "123",
+      idp_id: "00u-user",
+      userName: resource.userName,
+      repair_legacy: true,
+    });
     expect(response.status).toBe(200);
     expect(await getMappingByWorkosId(env.DB, directory.id, "Users", "00u-user")).toMatchObject({
       native_id: "123",
@@ -334,18 +358,13 @@ describe("Identity callback and rollback", () => {
       "/Users/00u-user",
       scimJson(200, { id: "00u-user", userName: resource.userName }),
     );
-    const response = await send(
-      "POST",
-      "/status/directories/directory_one/event-mapping/Users",
-      {
-        dsync_id: "directory_user_one",
-        native_id: "123",
-        idp_id: "00u-user",
-        userName: resource.userName,
-        repair_legacy: true,
-      },
-      { "X-SCIM-Bridge-Callback-Token": "identity-secret" },
-    );
+    const response = await send("POST", "/status/directories/directory_one/event-mapping/Users", {
+      dsync_id: "directory_user_one",
+      native_id: "123",
+      idp_id: "00u-user",
+      userName: resource.userName,
+      repair_legacy: true,
+    });
     expect(response.status).toBe(409);
     expect(await listIdpAliases(env.DB, directory.id)).toEqual([]);
   });
@@ -481,12 +500,12 @@ describe("Identity callback and rollback", () => {
       `/Groups/${publicId}`,
       scimJson(200, { id: publicId, externalId: publicId, displayName: "Team" }),
     );
-    const confirmed = await send(
-      "POST",
-      "/status/directories/directory_one/event-mapping/Groups",
-      { dsync_id: "directory_group_one", native_id: publicId, idp_id: "Team", displayName: "Team" },
-      { "X-SCIM-Bridge-Callback-Token": "identity-secret" },
-    );
+    const confirmed = await send("POST", "/status/directories/directory_one/event-mapping/Groups", {
+      dsync_id: "directory_group_one",
+      native_id: publicId,
+      idp_id: "Team",
+      displayName: "Team",
+    });
     expect(confirmed.status).toBe(200);
     expect(
       await getMappingByWorkosId(env.DB, directory.id, "Groups", "workos-group"),

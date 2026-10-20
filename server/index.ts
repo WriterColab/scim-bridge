@@ -59,7 +59,6 @@ if (config.encryptionKey) console.log("Per-directory token encryption: enabled")
 const env: PocEnv = {
   DB: store,
   WORKOS_API_KEY: config.workosApiKey ?? undefined,
-  SCIM_BRIDGE_CALLBACK_TOKEN: config.callbackToken ?? undefined,
 };
 // Rows written before proxy tokens were hashed at rest hold them in the clear.
 // Convert them before anything authenticates, and before the seeding below writes

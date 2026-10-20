@@ -35,14 +35,6 @@ import type { Directory, ResourceType } from "../shared/types";
  * found the row already there: a row is not a confirmation.
  */
 
-/** Held in process only — `native-app` boot sets it from the environment. Never
- *  written to the database, so there is no plaintext copy to protect at rest. */
-let callbackToken: string | null = null;
-
-export function rememberCallbackToken(token: string | null): void {
-  callbackToken = token || null;
-}
-
 const CALLBACK_TIMEOUT_MS = 5_000;
 
 interface PendingRecord {
@@ -259,8 +251,6 @@ async function postCallback(
   const base = await bridgeBase(db);
   const token = await clientTokenFor(db, directory.id);
   if (!base || !token) throw new Error("Event has no authenticated bridge mapping resolver");
-  if (!callbackToken)
-    throw new Error("SCIM_BRIDGE_CALLBACK_TOKEN is required to confirm a pending identity");
   const { kind, event } = pending;
   const name = eventName(kind, event);
   const raw = isRecord(event.raw_attributes) ? event.raw_attributes : {};
@@ -270,7 +260,6 @@ async function postCallback(
     method: "POST",
     headers: {
       Authorization: `Bearer ${token}`,
-      "X-SCIM-Bridge-Callback-Token": callbackToken,
       "Content-Type": "application/json",
     },
     body: JSON.stringify({

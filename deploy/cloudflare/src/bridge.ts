@@ -41,7 +41,6 @@ interface Env {
   PANEL_AUTH_PASSWORD?: string;
   APP_ENCRYPTION_KEY?: string;
   WORKOS_API_KEY?: string;
-  SCIM_BRIDGE_CALLBACK_TOKEN?: string;
 
   // Secrets, and only used by APP_ROLE=native-app deployments (the bundled stand-in
   // for a customer application; a real customer runs their own app instead).
@@ -79,7 +78,6 @@ export class BridgeContainer extends Container<Env> {
       PANEL_AUTH_PASSWORD: env.PANEL_AUTH_PASSWORD,
       APP_ENCRYPTION_KEY: env.APP_ENCRYPTION_KEY,
       WORKOS_API_KEY: env.WORKOS_API_KEY,
-      SCIM_BRIDGE_CALLBACK_TOKEN: env.SCIM_BRIDGE_CALLBACK_TOKEN,
       NATIVE_SCIM_TOKEN: env.NATIVE_SCIM_TOKEN,
       WEBHOOK_SECRET: env.WEBHOOK_SECRET,
       DIRECTORIES_JSON: env.DIRECTORIES_JSON,
