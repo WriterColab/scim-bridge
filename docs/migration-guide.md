@@ -160,11 +160,22 @@ Acme — Okta,https://acme.example.com/scim/v2,tok_native,https://api.workos.com
   namespace** — its own base URL, or its own token where you attest the service
   isolates rows by token; see
   [the namespace rule](./runbook.md#deployment-requirement-one-directory-per-native-scim-namespace).
-  The CSV can never attest — a flat-URL second directory is set up on its
-  directory page after import.
+  Bulk CSV imports can attest with an optional eighth column,
+  `native_token_partitioned`, set to `true` (or `1`). The default is false.
+  Every directory sharing the URL must attest and have a distinct, nonempty
+  native token. This enables the existing token-isolation rules; it does not
+  disable namespace checks.
 - `workos_url` + `workos_token` — already present from Step A; leave them as-is.
 
-Two fields are set on the directory's page after import, not in this CSV:
+The full optional CSV column order is:
+
+```csv
+name,native_url,native_token,workos_url,workos_token,workos_directory_id,proxy_token,native_token_partitioned
+```
+
+Older column prefixes remain valid. Quote names containing commas, quotes or
+newlines using standard CSV quoting. Two fields can be supplied in that CSV or
+set on the directory's page after import:
 
 - `proxy_token` — the bridge mints one on import and does **not** display it;
   press **Rotate** on the directory page to get a copyable token, shown once

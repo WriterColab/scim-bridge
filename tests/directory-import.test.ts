@@ -103,6 +103,103 @@ async function expectStoredToken(row: Directory, token: string): Promise<void> {
 
 describe("directory import", () => {
   describe("bulk CSV", () => {
+    it("imports quoted CSV and persists token-partitioned shared endpoints", async () => {
+      const env = await createEnv();
+      const csv = [
+        "name,native_url,native_token,workos_url,workos_token,workos_directory_id,proxy_token,native_token_partitioned",
+        '"Acme, Inc.",http://auth-v2/api/scim/v2,native-a,,,,proxy-token-for-org-a,true',
+        '"Globex ""Europe""",http://auth-v2/api/scim/v2,native-b,,,,proxy-token-for-org-b,true',
+      ].join("\r\n");
+      expect(await bulkImport(env, csv)).toEqual({ imported: 2, importErrors: [] });
+      const rows = await listDirectories(env.DB);
+      expect(rows.map((row) => row.name).sort()).toEqual(["Acme, Inc.", 'Globex "Europe"']);
+      expect(rows.every((row) => row.native_token_partitioned === 1)).toBe(true);
+      expect(rows.every((row) => row.mode === "passthrough")).toBe(true);
+      expect((await getDirectoryByToken(env.DB, "proxy-token-for-org-a"))?.native_token).toBe(
+        "native-a",
+      );
+    });
+
+    it.each([
+      ["true", "false", "native-b"],
+      ["true", "true", "native-a"],
+      ["true", "true", ""],
+    ])(
+      "refuses a non-partitioned CSV group (%s, %s, %s) before inserting",
+      async (first, second, token) => {
+        const env = await createEnv();
+        const result = await bulkImport(
+          env,
+          [
+            `Acme,http://auth-v2/api/scim/v2,native-a,,,,proxy-token-for-org-a,${first}`,
+            `Globex,http://auth-v2/api/scim/v2,${token},,,,proxy-token-for-org-b,${second}`,
+          ].join("\n"),
+        );
+        expect(result.error).toContain("Nothing was imported");
+        expect(await listDirectories(env.DB)).toEqual([]);
+      },
+    );
+
+    it.each([
+      "Acme,,,,,,,treu",
+      "Acme,,,,,,,true,unexpected",
+      '"unterminated,,,,,,,true',
+      "name,proxy_token\nAcme,proxy-token-for-org-a",
+    ])("rejects malformed CSV without writing or exposing credentials", async (csv) => {
+      const env = await createEnv();
+      const result = await bulkImport(env, csv);
+      expect(result.error).toBeTruthy();
+      expect(result.error).not.toContain("proxy-token-for-org-a");
+      expect(await listDirectories(env.DB)).toEqual([]);
+    });
+
+    it("accepts an attested CSV row alongside an existing attested directory", async () => {
+      const env = await createEnv();
+      await seedDirectory(env.DB, {
+        native_url: "http://auth-v2/api/scim/v2",
+        native_token: "native-a",
+        native_token_partitioned: 1,
+      });
+      const result = await bulkImport(
+        env,
+        "Globex,http://auth-v2/api/scim/v2,native-b,,,,proxy-token-for-org-b,true",
+      );
+      expect(result.imported).toBe(1);
+      expect(
+        (await getDirectoryByToken(env.DB, "proxy-token-for-org-b"))?.native_token_partitioned,
+      ).toBe(1);
+    });
+
+    it("requires the existing directory to attest before retrying a shared-URL import", async () => {
+      const env = await createEnv();
+      const existing = await seedDirectory(env.DB, {
+        name: "SCIM test org",
+        mode: "workos-primary",
+        native_url: "http://auth-v2/api/scim/v2",
+        native_token: "existing-native-token",
+        native_token_partitioned: 0,
+      });
+      const csv =
+        "Globex,http://auth-v2/api/scim/v2,new-native-token,,,,proxy-token-for-org-b,true";
+      const refused = await bulkImport(env, csv);
+      expect(refused.error).toContain("SCIM test org");
+      expect(await listDirectories(env.DB)).toHaveLength(1);
+
+      expect(
+        await postOverview(env, existing.id, {
+          intent: "save-native",
+          native_url: existing.native_url,
+          native_token: "existing-native-token",
+          native_token_partitioned: "on",
+        }),
+      ).toEqual({});
+      expect(await bulkImport(env, csv)).toEqual({ imported: 1, importErrors: [] });
+      const preserved = await getDirectoryById(env.DB, existing.id);
+      expect(preserved?.mode).toBe("workos-primary");
+      expect(preserved?.native_token).toBe("existing-native-token");
+      expect(preserved?.proxy_token_hash).toBe(existing.proxy_token_hash);
+    });
+
     it("imports a row written against the original six columns", async () => {
       const env = await createEnv();
 
@@ -521,7 +618,7 @@ describe("one directory per native SCIM namespace", () => {
       expect(result.error).toContain('row 2 ("Globex") of this same import');
     });
 
-    it("stays strict against an attested token-partitioned group — CSV rows never attest", async () => {
+    it("refuses unflagged CSV rows against an attested token-partitioned group", async () => {
       const env = await createEnv();
       // A stored, fully sanctioned token-partitioned directory on the endpoint.
       const orgA = await seedDirectory(env.DB, {

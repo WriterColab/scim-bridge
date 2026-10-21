@@ -225,9 +225,14 @@ enforces structurally into a promise only you can keep.** If your service does
 not actually isolate rows by token, a write meant for one directory lands on
 another's users — precisely the failure the per-path rule makes impossible.
 Because the token is now the tenant boundary, editing a native token to equal a
-neighbour's in the same attested group is refused, and the bulk CSV import
-never attests: rows sharing a `native_url` still refuse the whole file, and a
-second directory joins a flat URL only through the directory page.
+neighbour's in the same attested group is refused. Bulk CSV imports can make
+this same attestation with the optional eighth column `native_token_partitioned`:
+`true` or `1` enables it; blank, `false`, or `0` leaves it disabled. A shared-URL
+import is refused before inserting any row unless every existing and incoming
+directory in that group attests and the tokens remain distinct and nonempty.
+Older CSV files retain the default refusal. Column order is
+`name,native_url,native_token,workos_url,workos_token,workos_directory_id,proxy_token,native_token_partitioned`.
+Standard CSV quoting is supported for names containing commas, quotes or newlines.
 
 Attested groups are named at every boot as an `INFO` line and on the panel's
 directories page — an audit trail, not a warning.

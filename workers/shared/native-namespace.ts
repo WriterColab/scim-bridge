@@ -44,8 +44,8 @@ export type NamespaceDirectory = Pick<
 >;
 
 /** The token and attestation being saved alongside a native URL. Every checker
- *  takes today's fail-closed shape by default, so only the one panel path where
- *  an operator can attest passes anything else. */
+ *  takes today's fail-closed shape by default, so only panel paths where
+ *  an operator explicitly attests pass anything else. */
 export type CandidateEndpoint = Pick<Directory, "native_token" | "native_token_partitioned">;
 
 const UNATTESTED: CandidateEndpoint = { native_token: "", native_token_partitioned: 0 };
