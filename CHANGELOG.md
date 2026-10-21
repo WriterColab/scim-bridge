@@ -26,6 +26,11 @@ Container images for each version:
 
 ### Fixed
 
+- Bulk CSV imports preserve the optional `native_token_partitioned` attestation,
+  allowing shared native URLs only when every directory opts in with a distinct,
+  nonempty native token. Standard CSV quoting is supported; older files retain
+  the existing namespace checks.
+
 - Release divergence sweep stamps after every Reconcile from WorkOS, including
   partial failures and exceptions, so unresolved rows can be repaired by a later
   run. Upgrade clears stamps left by older runs. **After upgrading, run Reconcile

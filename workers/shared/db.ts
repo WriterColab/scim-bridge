@@ -168,6 +168,7 @@ export interface NewDirectory {
   name: string;
   native_url?: string;
   native_token?: string;
+  native_token_partitioned?: number;
   workos_url?: string;
   workos_token?: string;
   workos_directory_id?: string;
@@ -203,8 +204,8 @@ export async function insertDirectory(
       .prepare(
         "INSERT INTO scim_directories " +
           "(id, name, native_url, native_token, workos_url, workos_token, workos_directory_id, " +
-          "proxy_token_hash, proxy_token_hint) " +
-          "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          "proxy_token_hash, proxy_token_hint, native_token_partitioned) " +
+          "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       )
       .bind(
         id,
@@ -216,6 +217,7 @@ export async function insertDirectory(
         directory.workos_directory_id || null,
         proxyTokenHash,
         proxyTokenHint(proxyToken),
+        directory.native_token_partitioned ? 1 : 0,
       )
       .run(),
   );

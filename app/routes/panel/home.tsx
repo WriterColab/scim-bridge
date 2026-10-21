@@ -1,6 +1,7 @@
 import { panelEventLinkOptions, setPanelDirectoryMode } from "./event-link-cutover";
 import type { Route } from "./+types/home";
 
+import { parse } from "csv-parse/sync";
 import { Form, redirect, useActionData, useLoaderData, useNavigation } from "react-router";
 import {
   countNativeWriteFailures,
@@ -59,22 +60,35 @@ interface CsvRow {
   workos_token: string;
   workos_directory_id: string;
   proxy_token: string;
+  native_token_partitioned: number;
 }
 
-/** Parse the bulk-import CSV: one directory per line, columns in header order.
- *  A leading `name,...` header row is optional. Values must not contain commas
- *  (URLs and bearer tokens don't), so a simple split is sufficient. `proxy_token`
- *  trails the original six columns, so CSVs written against those import
- *  unchanged. */
+/** Accept older column prefixes while keeping optional credentials in fixed positions. */
 function parseCsv(text: string): CsvRow[] {
-  const lines = text
-    .split(/\r?\n/)
-    .map((l) => l.trim())
-    .filter((l) => l !== "");
-  const rows: CsvRow[] = [];
-  lines.forEach((line, i) => {
-    const cells = line.split(",").map((c) => c.trim());
-    if (i === 0 && cells[0]?.toLowerCase() === "name") return; // header
+  const columns = [
+    "name",
+    "native_url",
+    "native_token",
+    "workos_url",
+    "workos_token",
+    "workos_directory_id",
+    "proxy_token",
+    "native_token_partitioned",
+  ];
+  const records: string[][] = parse(text, {
+    bom: true,
+    trim: true,
+    skip_empty_lines: true,
+    relax_column_count: true,
+  });
+  if (records[0]?.[0]?.toLowerCase() === "name") {
+    const header = records.shift()!;
+    if (header.some((cell, index) => cell.toLowerCase() !== columns[index])) {
+      throw new Error("Invalid CSV header");
+    }
+  }
+  return records.map((cells) => {
+    if (cells.length > columns.length) throw new Error("Too many CSV columns");
     const [
       name = "",
       native_url = "",
@@ -83,8 +97,12 @@ function parseCsv(text: string): CsvRow[] {
       workos_token = "",
       workos_directory_id = "",
       proxy_token = "",
+      partitioned = "",
     ] = cells;
-    rows.push({
+    if (!["", "0", "1", "false", "true"].includes(partitioned.toLowerCase())) {
+      throw new Error("Invalid token partition attestation");
+    }
+    return {
       name,
       native_url,
       native_token,
@@ -92,9 +110,9 @@ function parseCsv(text: string): CsvRow[] {
       workos_token,
       workos_directory_id,
       proxy_token,
-    });
+      native_token_partitioned: ["1", "true"].includes(partitioned.toLowerCase()) ? 1 : 0,
+    };
   });
-  return rows;
 }
 
 /** An imported proxy token is a credential an IdP is already presenting, so a
@@ -166,7 +184,7 @@ function csvNamespaceRefusals(
       refusals.push(`Row ${line} (${row.name}): ${nativeUrlError}`);
       continue;
     }
-    const twin = findNativeNamespaceConflict(url, accepted);
+    const twin = findNativeNamespaceConflict(url, accepted, row);
     if (twin) {
       refusals.push(
         `Row ${line} (${row.name}): ` +
@@ -174,20 +192,17 @@ function csvNamespaceRefusals(
       );
       continue;
     }
-    const stored = checkNativeNamespace(url, existing);
+    const stored = checkNativeNamespace(url, existing, row);
     if (stored) {
       refusals.push(`Row ${line} (${row.name}): ${stored}`);
       continue;
     }
-    // A CSV row is never attested: token partitioning is a deliberate
-    // per-directory act on the directory page, not a column someone pastes
-    // without reading. So an import can only ever *tighten* against these rows.
     accepted.push({
       id: `row ${line}`,
       name: row.name,
       native_url: url,
       native_token: row.native_token,
-      native_token_partitioned: 0,
+      native_token_partitioned: row.native_token_partitioned,
       line,
     });
   }
@@ -283,7 +298,16 @@ export async function action({ context, request }: Route.ActionArgs) {
   }
 
   if (intent === "bulk-import") {
-    const rows = parseCsv(field("csv"));
+    let rows: CsvRow[];
+    try {
+      rows = parseCsv(field("csv"));
+    } catch {
+      // Parser exceptions can contain the original row, including bearer tokens.
+      return {
+        error:
+          "Nothing was imported. Check CSV quoting, column order, and native_token_partitioned (true/false or 1/0).",
+      };
+    }
     if (rows.length === 0) {
       return { error: "No directories found in the CSV. Add one directory per line." };
     }
@@ -489,7 +513,7 @@ export default function PanelHome() {
                 <Flex direction="column" gap="5">
                   <Dialog.Header
                     title="Bulk import directories"
-                    description="One directory per line. Columns: name, native SCIM URL, native token, WorkOS endpoint, WorkOS token, WorkOS directory id, proxy token. Only the name is required; the rest can be filled per directory later."
+                    description="One directory per line. Columns: name, native SCIM URL, native token, WorkOS endpoint, WorkOS token, WorkOS directory id, proxy token, token partition attestation (optional). Only the name is required; the rest can be filled per directory later."
                     error={actionData?.error}
                   />
                   <input type="hidden" name="intent" value="bulk-import" />
@@ -501,14 +525,16 @@ export default function PanelHome() {
                       resize="vertical"
                       rows={8}
                       placeholder={
-                        "name,native_url,native_token,workos_url,workos_token,workos_directory_id,proxy_token\n" +
-                        "Acme — Okta,https://acme.com/scim/v2,tok_native,https://api.workos.com/scim/v2.0/xxx,tok_workos,directory_01XXX,tok_idp_existing"
+                        "name,native_url,native_token,workos_url,workos_token,workos_directory_id,proxy_token,native_token_partitioned\n" +
+                        "Acme — Okta,https://acme.com/scim/v2,tok_native,https://api.workos.com/scim/v2.0/xxx,tok_workos,directory_01XXX,tok_idp_existing,false"
                       }
                     />
                     <Text color="gray" size="1">
-                      A leading header row is optional. Values must not contain commas. Leave the
-                      last column off to mint a proxy token per directory; fill it in with the
-                      bearer token that directory's IdP already presents.
+                      A leading header row is optional. Quote values containing commas or newlines.
+                      Supply proxy_token to preserve the bearer token the IdP already presents;
+                      leave it empty to mint one. Set native_token_partitioned to true only when the
+                      native service isolates tenants by token. Every directory sharing a native URL
+                      must attest and use a distinct, nonempty native token.
                     </Text>
                   </Flex>
                   <Dialog.Footer>
