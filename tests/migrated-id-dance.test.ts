@@ -1,3 +1,4 @@
+import { listIdpAliases } from "../workers/shared/idp-aliases";
 import { afterEach, describe, expect, it } from "vitest";
 import proxyWorker from "../workers/proxy/index";
 import { MIGRATED_ID_HEADER } from "../workers/shared/types";
@@ -709,13 +710,9 @@ describe("migrated-id dance", () => {
       expect(migratedId(workos[0])).toBe("ext-1");
       expect(migratedId(workos[1])).toBe("ext-1");
       expect(fake.callsTo("native")).toHaveLength(0);
-      expect(await allMappings(env.DB, directory.id)).toEqual([
-        {
-          resource_type: "Users",
-          native_id: "ext-1",
-          workos_id: "ext-1",
-          strategy: "migrated-id",
-        },
+      expect(await allMappings(env.DB, directory.id)).toEqual([]);
+      expect(await listIdpAliases(env.DB, directory.id)).toMatchObject([
+        { idp_id: "ext-1", workos_id: "ext-1", native_id: null },
       ]);
     });
 
@@ -739,13 +736,9 @@ describe("migrated-id dance", () => {
       const created = (await res.json()) as { id: string };
       expect(created.id).not.toBe("victim-1");
       expect(created.id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
-      expect(await allMappings(env.DB, directory.id)).toEqual([
-        {
-          resource_type: "Users",
-          native_id: created.id,
-          workos_id: created.id,
-          strategy: "migrated-id",
-        },
+      expect(await allMappings(env.DB, directory.id)).toEqual([]);
+      expect(await listIdpAliases(env.DB, directory.id)).toMatchObject([
+        { idp_id: created.id, workos_id: created.id, native_id: null },
       ]);
     });
 
@@ -831,13 +824,9 @@ describe("migrated-id dance", () => {
       expect(created.id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
       const workos = fake.callsTo("workos");
       expect(migratedId(workos[0])).toBe(created.id);
-      expect(await allMappings(env.DB, directory.id)).toEqual([
-        {
-          resource_type: "Users",
-          native_id: created.id,
-          workos_id: created.id,
-          strategy: "migrated-id",
-        },
+      expect(await allMappings(env.DB, directory.id)).toEqual([]);
+      expect(await listIdpAliases(env.DB, directory.id)).toMatchObject([
+        { idp_id: created.id, workos_id: created.id, native_id: null },
       ]);
     });
 
@@ -902,13 +891,9 @@ describe("migrated-id dance", () => {
       expect(res.status).toBe(201);
       expect(await res.json()).toEqual({ id: "ext-1" });
       expect(legs(fake.callsTo("workos"))).toEqual(["PUT /Users/ext-1"]);
-      expect(await allMappings(env.DB, directory.id)).toEqual([
-        {
-          resource_type: "Users",
-          native_id: "ext-1",
-          workos_id: "ext-1",
-          strategy: "migrated-id",
-        },
+      expect(await allMappings(env.DB, directory.id)).toEqual([]);
+      expect(await listIdpAliases(env.DB, directory.id)).toMatchObject([
+        { idp_id: "ext-1", workos_id: "ext-1", native_id: null },
       ]);
     });
 
@@ -937,17 +922,13 @@ describe("migrated-id dance", () => {
         "POST /Users",
         "PUT /Users/ext-1",
       ]);
-      expect(await allMappings(env.DB, directory.id)).toEqual([
-        {
-          resource_type: "Users",
-          native_id: "ext-1",
-          workos_id: "ext-1",
-          strategy: "migrated-id",
-        },
+      expect(await allMappings(env.DB, directory.id)).toEqual([]);
+      expect(await listIdpAliases(env.DB, directory.id)).toMatchObject([
+        { idp_id: "ext-1", workos_id: "ext-1", native_id: null },
       ]);
     });
 
-    it("a create onto an already-mapped id answers 201 after the mapped PUT", async () => {
+    it("a create cannot claim an already-mapped native id from externalId", async () => {
       const { env, directory, fake } = await setup({ mode: "workos-only" });
       await seedMapping(env.DB, directory, "Users", "ext-1", "wos_1", "fallback-post");
       fake.route(
@@ -962,10 +943,9 @@ describe("migrated-id dance", () => {
         userName: "a@b.c",
       });
 
-      expect(res.status).toBe(201);
-      // The IdP only ever sees the minted id, never the WorkOS-minted one.
-      expect(await res.json()).toEqual({ id: "ext-1", userName: "a@b.c" });
-      expect(legs(fake.callsTo("workos"))).toEqual(["PUT /Users/wos_1"]);
+      expect(res.status).toBe(409);
+      expect(fake.callsTo("workos")).toHaveLength(0);
+      expect(await listIdpAliases(env.DB, directory.id)).toEqual([]);
     });
   });
 
@@ -992,20 +972,16 @@ describe("migrated-id dance", () => {
       expect(workos[0].json()).toEqual({ userName: "ada@example.com", id: "wos_9" });
     });
 
-    it("a first-touch replace self-heals into a POST create but still answers 200", async () => {
+    it("an unmapped replace cannot invent a native association", async () => {
       const { env, directory, fake } = await setup({ mode: "workos-only" });
       fake.route("workos", "PUT", "/Users/u1", scimJson(404, { detail: "nope" }), { once: true });
       fake.route("workos", "POST", "/Users", scimJson(201, { id: "u1", userName: "a@b.c" }));
 
       const res = await send(env, directory, "PUT", "/scim/v2/Users/u1", { userName: "a@b.c" });
 
-      // The IdP issued a PUT, so it gets a 200 even though the dance created (201).
-      expect(res.status).toBe(200);
-      expect(await res.json()).toEqual({ id: "u1", userName: "a@b.c" });
-      expect(legs(fake.callsTo("workos"))).toEqual(["PUT /Users/u1", "POST /Users"]);
-      expect(await allMappings(env.DB, directory.id)).toEqual([
-        { resource_type: "Users", native_id: "u1", workos_id: "u1", strategy: "migrated-id" },
-      ]);
+      expect(res.status).toBe(404);
+      expect(fake.callsTo("workos")).toEqual([]);
+      expect(await allMappings(env.DB, directory.id)).toEqual([]);
     });
 
     it("group replaces write members in WorkOS-id space and translate them back for the IdP", async () => {

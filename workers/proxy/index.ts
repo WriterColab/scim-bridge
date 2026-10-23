@@ -1,3 +1,10 @@
+import {
+  AliasConflictError,
+  getIdpAlias,
+  listIdpAliases,
+  saveIdpAlias,
+} from "../shared/idp-aliases";
+import { rewriteAliasRequest, rewriteAliasResponse, translateAliasFilter } from "./alias-boundary";
 import type { Datastore } from "../shared/datastore";
 import type { Directory, PocEnv, ResourceType, WorkerHandler } from "../shared/types";
 import {
@@ -6,6 +13,7 @@ import {
   clearNativeWriteFailure,
   deleteMapping,
   getDirectoryByToken,
+  getDirectoryById,
   getMapping,
   getMappingByWorkosId,
   insertProxyLog,
@@ -68,6 +76,99 @@ const handler: WorkerHandler<PocEnv> = {
 export default handler;
 
 async function handleScim(
+  request: Request,
+  env: PocEnv,
+  ctx: ExecutionContext,
+  url: URL,
+): Promise<Response> {
+  let release: (() => Promise<void>) | undefined;
+  try {
+    const directory = await getDirectoryByToken(
+      env.DB,
+      authorizationToken(request.headers.get("Authorization")),
+    );
+    if (!directory) return handleScimCore(request, env, ctx, url);
+    let aliases = await listIdpAliases(env.DB, directory.id);
+    if (!aliases.length) return handleScimCore(request, env, ctx, url);
+    const path = parseScimPath(url.pathname);
+    const addressed = aliases.find(
+      (a) => a.resource_type === path?.kind && (a.idp_id === path.id || a.native_id === path.id),
+    );
+    if (
+      request.method === "DELETE" &&
+      addressed &&
+      directory.mode !== "workos-primary" &&
+      directory.mode !== "workos-only"
+    ) {
+      const token = crypto.randomUUID();
+      if (!(await claimWorkosPrimaryCreate(env.DB, directory.id, addressed.resource_type, token)))
+        return scimError(503, "An identity operation is in flight; retry deletion");
+      release = () =>
+        releaseWorkosPrimaryCreate(env.DB, directory.id, addressed.resource_type, token);
+      const fresh = await getDirectoryById(env.DB, directory.id);
+      if (fresh?.mode !== directory.mode)
+        return scimError(503, "Directory mode changed; retry deletion");
+      aliases = await listIdpAliases(env.DB, directory.id);
+    }
+    const translated = aliases.length
+      ? await rewriteAliasRequest(request, aliases, directory.mode)
+      : request;
+    const response = await handleScimCore(translated, env, ctx, new URL(translated.url));
+    if (
+      addressed &&
+      request.method === "DELETE" &&
+      directory.mode !== "workos-only" &&
+      directory.mode !== "workos-primary" &&
+      (isSuccess(response.status) || response.status === 404)
+    ) {
+      await env.DB.batch([
+        env.DB.prepare(
+          "UPDATE idp_aliases SET deleted = 1 WHERE directory_id = ? AND resource_type = ? AND idp_id = ?",
+        ).bind(directory.id, addressed.resource_type, addressed.idp_id),
+        env.DB.prepare(
+          "UPDATE scim_directories SET rollback_revision = rollback_revision + 1, rollback_verified_revision = NULL WHERE id = ?",
+        ).bind(directory.id),
+      ]);
+    }
+    return aliases.length
+      ? await rewriteAliasResponse(response, request, await listIdpAliases(env.DB, directory.id), [
+          directory.native_url,
+          directory.workos_url,
+        ])
+      : response;
+  } catch (error) {
+    const response = scimError(
+      error instanceof AliasConflictError ? 409 : 503,
+      errorMessage(error),
+    );
+    if (response.status === 503) response.headers.set("Retry-After", "5");
+    return response;
+  } finally {
+    if (release) await release();
+  }
+}
+
+async function retirePublicIdentity(
+  db: Datastore,
+  directoryId: string,
+  kind: ResourceType,
+  id: string,
+): Promise<void> {
+  await db.batch([
+    db
+      .prepare(
+        "UPDATE idp_aliases SET deleted = 1 WHERE directory_id = ? AND resource_type = ? AND (idp_id = ? OR native_id = ?)",
+      )
+      .bind(directoryId, kind, id, id),
+    db
+      .prepare(
+        "UPDATE scim_directories SET rollback_revision = rollback_revision + 1, rollback_verified_revision = NULL WHERE id = ?",
+      )
+      .bind(directoryId),
+  ]);
+}
+
+async function handleScimCore(
   request: Request,
   env: PocEnv,
   ctx: ExecutionContext,
@@ -772,6 +873,7 @@ async function workosPrimaryWrite(
   if (method === "DELETE" && scimPath.id !== null) {
     try {
       await deleteMapping(env.DB, directory.id, kind, scimPath.id);
+      await retirePublicIdentity(env.DB, directory.id, kind, scimPath.id);
     } catch (error) {
       log.error = `id mapping prune failed: ${errorMessage(error)}`;
       if (deleteClaim) deleteClaim.canRelease = false;
@@ -1430,6 +1532,89 @@ function identity(response: Response): Response {
 
 async function workosOnly(
   env: PocEnv,
+  ctx: ExecutionContext,
+  directory: Directory,
+  scimPath: ScimPath,
+  method: string,
+  requestBody: string | null,
+  contentType: string | null,
+  url: URL,
+  log: ProxyLogInsert,
+  finish: (response: Response) => Response,
+): Promise<Response> {
+  if (directory.mode !== "workos-only" || !WRITE_METHODS.has(method) || !scimPath.kind)
+    return workosOnlyRequest(
+      env,
+      ctx,
+      directory,
+      scimPath,
+      method,
+      requestBody,
+      contentType,
+      url,
+      log,
+      finish,
+    );
+  // Creates and pending replacements own their claim inside createWithMigratedId.
+  const pending = scimPath.id
+    ? await getIdpAlias(env.DB, directory.id, scimPath.kind, scimPath.id)
+    : null;
+  if (method === "POST" || (method === "PUT" && pending && !pending.native_id))
+    return workosOnlyRequest(
+      env,
+      ctx,
+      directory,
+      scimPath,
+      method,
+      requestBody,
+      contentType,
+      url,
+      log,
+      finish,
+    );
+  const token = crypto.randomUUID();
+  if (!(await claimWorkosPrimaryCreate(env.DB, directory.id, scimPath.kind, token)))
+    return finish(scimError(503, "An identity operation is in flight; retry the write"));
+  let release = true;
+  try {
+    const current = await getDirectoryById(env.DB, directory.id);
+    if (current?.mode !== "workos-only")
+      return finish(scimError(503, "Directory mode changed; retry the write"));
+    await env.DB.prepare(
+      "UPDATE scim_directories SET rollback_revision = rollback_revision + 1, rollback_verified_revision = NULL WHERE id = ?",
+    )
+      .bind(directory.id)
+      .run();
+    const response = await workosOnlyRequest(
+      env,
+      ctx,
+      directory,
+      scimPath,
+      method,
+      requestBody,
+      contentType,
+      url,
+      log,
+      finish,
+    );
+    release = response.headers.get("X-SCIM-Bridge-Uncertain-Create") !== "1";
+    const headers = new Headers(response.headers);
+    headers.delete("X-SCIM-Bridge-Uncertain-Create");
+    if (
+      method === "DELETE" &&
+      scimPath.id &&
+      (isSuccess(response.status) || response.status === 404)
+    ) {
+      await retirePublicIdentity(env.DB, directory.id, scimPath.kind, scimPath.id);
+    }
+    return new Response(response.body, { status: response.status, headers });
+  } finally {
+    if (release) await releaseWorkosPrimaryCreate(env.DB, directory.id, scimPath.kind, token);
+  }
+}
+
+async function workosOnlyRequest(
+  env: PocEnv,
   _ctx: ExecutionContext,
   directory: Directory,
   scimPath: ScimPath,
@@ -1448,8 +1633,18 @@ async function workosOnly(
 
   if (kind) {
     const maps = await loadIdMaps(env.DB, directory.id);
+    for (const alias of await listIdpAliases(env.DB, directory.id)) {
+      if (alias.deleted || alias.native_id) continue;
+      maps.nativeToWorkos[alias.resource_type].set(alias.idp_id, alias.workos_id);
+      maps.workosToNative[alias.resource_type].set(alias.workos_id, alias.idp_id);
+    }
     mappedWorkosIds = maps.workosToNative;
     const toWorkos = makeTranslator(maps.nativeToWorkos);
+    const filter = url.searchParams.get("filter");
+    if (filter) {
+      const rewritten = translateAliasFilter(filter, kind, toWorkos);
+      if (rewritten !== filter) url.searchParams.set("filter", rewritten);
+    }
     toNative = makeTranslator(maps.workosToNative);
     // A create after cutover must still mint a migrated id (not let WorkOS
     // assign a native one), or the new resource can't be referenced by the
@@ -1596,44 +1791,122 @@ async function createWithMigratedId(
   requestBody: string | null,
   toWorkos: (kind: ResourceType, id: string) => string,
   log: ProxyLogInsert,
+  existingPublicId?: string,
 ): Promise<Response> {
-  const parsed = parseJson(requestBody) ?? {};
-  const body = kind === "Groups" ? translateResourceIds(parsed, kind, toWorkos) : parsed;
-  delete body.id;
-  // Derive the id from the IdP's externalId, so the native app — which learns of
-  // this create via a DSync webhook carrying that same externalId — and WorkOS
-  // all address the resource by one shared id. Without this, a resource born in
-  // workos-only gets a random id the native app never sees, and a later rollback
-  // to a native-writing mode can't target it (404) and backfill 409s. Works for
-  // groups too: WorkOS surfaces a group's idp_id as its displayName but stores
-  // the externalId (raw_attributes.externalId), which the native listener reads.
-  // Only where this directory has the native namespace to itself. The externalId
-  // is the tenant's own value, and the minted id both addresses a native row and
-  // is recorded in `id_mappings` as this directory's, so in a shared namespace a
-  // tenant could name a neighbour's (or the app's own) row and have a later
-  // reconcile write over it under cover of that mapping.
-  const externalId = typeof body.externalId === "string" ? body.externalId : null;
-  const shared = await nativeNamespaceIsShared(db, directory);
-  const mintedId = !shared && externalId ? externalId : crypto.randomUUID();
-  const result = await mirrorUpsert(db, directory, kind, mintedId, body);
-  applyMirrorResult(log, result);
-  if (!result.ok) {
-    return scimError(
-      result.status && result.status >= 400 ? result.status : 502,
-      `The WorkOS endpoint rejected the migrated-id create: ${result.error ?? "unknown error"}.`,
+  const token = crypto.randomUUID();
+  if (!(await claimWorkosPrimaryCreate(db, directory.id, kind, token)))
+    return scimError(503, "A create, callback, or reconciliation is in flight; retry later");
+  let release = true;
+  try {
+    const current = await getDirectoryById(db, directory.id);
+    if (current?.mode !== "workos-only")
+      return scimError(503, "Directory mode changed; retry the request");
+    await db
+      .prepare(
+        "UPDATE scim_directories SET rollback_revision = rollback_revision + 1, rollback_verified_revision = NULL WHERE id = ?",
+      )
+      .bind(directory.id)
+      .run();
+    const parsed = parseJson(requestBody) ?? {};
+    const name =
+      typeof parsed[kind === "Users" ? "userName" : "displayName"] === "string"
+        ? String(parsed[kind === "Users" ? "userName" : "displayName"])
+        : "";
+    const external =
+      typeof parsed.externalId === "string" && parsed.externalId ? parsed.externalId : null;
+    const aliases = (await listIdpAliases(db, directory.id)).filter(
+      (a) =>
+        a.resource_type === kind &&
+        (existingPublicId
+          ? a.idp_id === existingPublicId
+          : external
+            ? a.external_id === external
+            : a.resource_name === name),
     );
+    if (aliases.length > 1 || aliases.some((a) => a.deleted))
+      return scimError(
+        409,
+        "Public identity is ambiguous or retired; operator recovery is required",
+      );
+    const alias = aliases[0];
+    const shared = await nativeNamespaceIsShared(db, directory);
+    const publicId = alias?.idp_id ?? (!shared && external ? external : crypto.randomUUID());
+    if (
+      !alias &&
+      ((await getIdpAlias(db, directory.id, kind, publicId)) ||
+        (await getMapping(db, directory.id, kind, publicId)) ||
+        (await getMappingByWorkosId(db, directory.id, kind, publicId)))
+    )
+      return scimError(409, "This public id is already owned by another resource");
+    const body = kind === "Groups" ? translateResourceIds(parsed, kind, toWorkos) : { ...parsed };
+    delete body.id;
+    const sink: MappingSink = [];
+    release = false;
+    const nativeId = alias?.native_id ?? publicId;
+    const result = await mirrorUpsert(
+      db,
+      directory,
+      kind,
+      nativeId,
+      body,
+      sink,
+      false,
+      alias
+        ? {
+            directory_id: directory.id,
+            resource_type: kind,
+            native_id: nativeId,
+            workos_id: alias.workos_id,
+            strategy: nativeId === alias.workos_id ? "migrated-id" : "fallback-post",
+          }
+        : null,
+    );
+    applyMirrorResult(log, result);
+    if (!result.ok) {
+      release =
+        result.status !== null &&
+        result.status >= 400 &&
+        result.status < 500 &&
+        result.status !== 408;
+      return scimError(
+        result.status && result.status >= 400 ? result.status : 502,
+        `The WorkOS endpoint rejected the migrated-id create: ${result.error ?? "unknown error"}`,
+      );
+    }
+    const mapped = sink.at(-1);
+    if (!mapped)
+      return scimError(
+        502,
+        "WorkOS create did not confirm an identity; operator recovery is required",
+      );
+    await saveIdpAlias(db, {
+      directory_id: directory.id,
+      resource_type: kind,
+      idp_id: publicId,
+      workos_id: mapped.workos_id,
+      native_id: alias?.native_id ?? null,
+      external_id: external,
+      resource_name: name,
+      deleted: 0,
+    });
+    if (alias?.native_id) await upsertMapping(db, mapped);
+    release = true;
+    const maps = await loadIdMaps(db, directory.id);
+    for (const a of await listIdpAliases(db, directory.id))
+      maps.workosToNative[a.resource_type].set(a.workos_id, a.idp_id);
+    const created = translateResourceIds(
+      parseJson(result.body) ?? body,
+      kind,
+      makeTranslator(maps.workosToNative),
+    );
+    created.id = publicId;
+    return new Response(JSON.stringify(created), {
+      status: 201,
+      headers: { "Content-Type": SCIM_CONTENT_TYPE },
+    });
+  } finally {
+    if (release) await releaseWorkosPrimaryCreate(db, directory.id, kind, token);
   }
-  const created = parseJson(result.body) ?? { ...body, id: mintedId };
-  created.id = mintedId;
-  // A create always answers the IdP with 201, even when the dance resolved on a
-  // PUT leg (200) because the resource already sat under the minted id. That id
-  // is derived from the IdP's externalId, so resolving is an idempotent create of
-  // the same logical resource, not a conflict. Symmetric with the replace path,
-  // which always answers 200 even when it self-heals via a POST create.
-  return new Response(JSON.stringify(created), {
-    status: 201,
-    headers: { "Content-Type": SCIM_CONTENT_TYPE },
-  });
 }
 
 /**
@@ -1650,26 +1923,44 @@ async function replaceWithMigratedId(
   toWorkos: (kind: ResourceType, id: string) => string,
   log: ProxyLogInsert,
 ): Promise<Response> {
+  const pending = await getIdpAlias(db, directory.id, kind, nativeId);
+  if (pending && !pending.native_id) {
+    if (pending.deleted) return scimError(404, "This public SCIM id is retired");
+    const body = parseJson(requestBody) ?? {};
+    if (
+      pending.external_id &&
+      body.externalId !== undefined &&
+      body.externalId !== pending.external_id
+    )
+      return scimError(409, "A pending identity cannot change externalId before binding");
+    const response = await createWithMigratedId(
+      db,
+      directory,
+      kind,
+      JSON.stringify({
+        ...body,
+        ...(pending.external_id ? { externalId: pending.external_id } : {}),
+      }),
+      toWorkos,
+      log,
+      pending.idp_id,
+    );
+    return response.status === 201
+      ? new Response(response.body, { status: 200, headers: response.headers })
+      : response;
+  }
   const parsed = parseJson(requestBody) ?? {};
   // Group member values are written in WorkOS-id space; the top-level id is
   // keyed off the path (nativeId), so mirrorUpsert owns it.
   const body = kind === "Groups" ? translateResourceIds(parsed, kind, toWorkos) : parsed;
-  // A replace with no mapping yet self-heals by minting one keyed on the path id.
-  // That id is the tenant's own value and the mapping is this directory's claim on
-  // a native row, so where a neighbour fronts the same native app it would let a
-  // tenant name the neighbour's (or the app's own) row and have a later reconcile
-  // write over it — the same attribution the create leg refuses to derive. Fail
-  // closed: nothing exists under this id yet, so 404 is the honest SCIM answer,
-  // and the IdP's create fallback goes through the leg that mints safely.
+  // A caller-supplied address does not prove a native resource exists. In
+  // WorkOS-only mode, require a prior create/confirmation rather than inventing
+  // a native mapping on PUT. Other modes retain their shared-namespace guard.
   if (
     !(await getMapping(db, directory.id, kind, nativeId)) &&
-    (await nativeNamespaceIsShared(db, directory))
+    (directory.mode === "workos-only" || (await nativeNamespaceIsShared(db, directory)))
   ) {
-    // The reason names the neighbour, so it goes to the operator's log rather
-    // than to the tenant that just tried to claim the id.
-    log.error =
-      `${kind}/${nativeId}: unmapped, and another directory fronts this native app, so the ` +
-      "id in the request cannot be adopted as this directory's; replace refused";
+    log.error = `${kind}/${nativeId}: replace has no confirmed native association`;
     return scimError(
       404,
       `No ${kind} resource with id ${nativeId} is mapped for this directory, so it cannot be ` +
@@ -1687,10 +1978,16 @@ async function replaceWithMigratedId(
   );
   applyMirrorResult(log, result);
   if (!result.ok) {
-    return scimError(
+    const response = scimError(
       result.status && result.status >= 400 ? result.status : 502,
       `The WorkOS endpoint rejected the migrated-id replace: ${result.error ?? "unknown error"}.`,
     );
+    if (
+      result.mayHaveCreated &&
+      (result.status === null || result.status >= 500 || result.status === 408)
+    )
+      response.headers.set("X-SCIM-Bridge-Uncertain-Create", "1");
+    return response;
   }
   // Reload after the write so a freshly created resource's mapping is visible,
   // then translate the response back to native ids for the IdP.

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import proxyWorker from "../workers/proxy/index";
 import { handleDsyncWebhook } from "../workers/native/listener";
 import { runBackfill, runReconcileFromWorkos } from "../workers/shared/backfill";
-import { setConfig, setDirectoryMode } from "../workers/shared/db";
+import { setConfig, setDirectoryMode, upsertMapping } from "../workers/shared/db";
 import { MIGRATED_ID_HEADER } from "../workers/shared/types";
 import type { ListenerEvent, PocEnv, ProxyLogEntry } from "../workers/shared/types";
 import {
@@ -525,7 +525,7 @@ describe("cross-cutting seams", () => {
       expect(rows[0].error).toBeNull();
     });
 
-    it("logs a refused replace with the neighbour reason the tenant's 404 withholds", async () => {
+    it("logs an unmapped replace refusal without sending it upstream", async () => {
       const directory = await seedDirectory(env.DB, { mode: "workos-only", log_persistence: 1 });
       await seedDirectory(env.DB, { name: "Org B" });
       installWorkosScim(fake);
@@ -541,13 +541,20 @@ describe("cross-cutting seams", () => {
       expect(res.status).toBe(404);
       const rows = await proxyLogs(env);
       expect(rows).toHaveLength(1);
-      expect(rows[0].error).toContain("another directory fronts this native app");
+      expect(rows[0].error).toContain("no confirmed native association");
       expect(rows[0].response_status).toBe(404);
       expect(rows[0].workos_request).toBeNull();
     });
 
     it("logs a self-healed replace with workos_status 201 but response_status 200", async () => {
       const directory = await seedDirectory(env.DB, { mode: "workos-only", log_persistence: 1 });
+      await upsertMapping(env.DB, {
+        directory_id: directory.id,
+        resource_type: "Users",
+        native_id: "u5",
+        workos_id: "u5",
+        strategy: "migrated-id",
+      });
       installWorkosScim(fake);
 
       const ctx = createCtx();

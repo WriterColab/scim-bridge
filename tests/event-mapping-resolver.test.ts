@@ -1,10 +1,12 @@
+import { createHmac } from "node:crypto";
 import { afterEach, describe, expect, it } from "vitest";
-import { loadConfig, seedNativeAppDirectories } from "../server/config";
+import { loadConfig, seedNativeAppConfig, seedNativeAppDirectories } from "../server/config";
 import proxyWorker from "../workers/proxy/index";
 import { handleDsyncWebhook } from "../workers/native/listener";
 import { NATIVE_TABLES, ScimStore } from "../workers/native/store";
 import { fetchEventNativeId } from "../workers/native/status-client";
 import { getEventLink } from "../workers/shared/event-links";
+import { getIdpAlias } from "../workers/shared/idp-aliases";
 import {
   getMappingByWorkosId,
   listDirectories,
@@ -22,7 +24,9 @@ import {
 
 describe("directory-authenticated event identity resolver", () => {
   let fake: FakeUpstreams | undefined;
-  afterEach(() => fake?.restore());
+  afterEach(() => {
+    fake?.restore();
+  });
 
   async function setup() {
     const env = await createEnv();
@@ -292,66 +296,134 @@ describe("directory-authenticated event identity resolver", () => {
       createCtx(),
     );
     expect(created.status).toBe(201);
-    fake!.route(
-      "workos",
-      "GET",
-      /^\/Users\?/,
+    expect(((await created.json()) as { id: string }).id).toBe(scimId);
+    let listing: Record<string, unknown>[] = [
+      { id: scimId, userName: "new@example.com", active: true },
+    ];
+    fake!.route("workos", "GET", /^\/Users\?/, () =>
       Response.json({
-        totalResults: 1,
+        totalResults: listing.length,
         startIndex: 1,
-        itemsPerPage: 1,
-        Resources: [{ id: scimId, userName: "new@example.com", active: true }],
+        itemsPerPage: listing.length,
+        Resources: listing,
       }),
-      { once: true },
     );
     const native = await createEnv();
-    await seedNativeAppDirectories(
-      native,
-      loadConfig({
-        APP_ROLE: "native-app",
-        WEBHOOK_SECRET: "secret",
-        DIRECTORIES_JSON: JSON.stringify([
-          { workos_directory_id: "directory_resolver", proxy_token: directory.proxy_token },
-        ]),
-      }),
-    );
-    await setConfig(native.DB, "proxy.public_url", "https://bridge.test");
-    await native.DB.prepare("DELETE FROM poc_config WHERE key = 'proxy.loopback_url'").run();
+    const nativeConfig = loadConfig({
+      APP_ROLE: "native-app",
+      WEBHOOK_SECRET: "secret",
+      BRIDGE_STATUS_URL: "https://bridge.test",
+      DIRECTORIES_JSON: JSON.stringify([
+        { workos_directory_id: "directory_resolver", proxy_token: directory.proxy_token },
+      ]),
+    });
+    await seedNativeAppConfig(native, nativeConfig);
+    await seedNativeAppDirectories(native, nativeConfig);
     const [local] = await listDirectories(native.DB);
     expect(local.workos_token).toBe("");
     expect(local.workos_url).toBe("");
+    expect(
+      await native.DB.prepare("SELECT key FROM poc_config WHERE value = 'callback-secret'").first(),
+    ).toBeNull();
+    const store = new ScimStore(native.DB, NATIVE_TABLES);
+    // The bridge proves the reported row by reading it from the native app.
+    const nativeReads: string[] = [];
+    fake!.route("native", "GET", /^\/Users\//, async (call) => {
+      const id = decodeURIComponent(call.path.slice("/Users/".length));
+      nativeReads.push(id);
+      const row = await store.userById(id);
+      return row
+        ? Response.json(JSON.parse(row.resource))
+        : Response.json({ detail: "missing" }, { status: 404 });
+    });
+    const callbacks: { headers: Headers; body: string }[] = [];
+    let failCallback = true;
     const upstreamFetch = globalThis.fetch;
     globalThis.fetch = async (input, init) => {
       const request = input instanceof Request ? input : new Request(input, init);
-      if (new URL(request.url).origin === "https://bridge.test")
+      if (new URL(request.url).origin === "https://bridge.test") {
+        if (request.method === "POST") {
+          callbacks.push({ headers: request.headers, body: await request.clone().text() });
+          if (failCallback) return Response.json({ error: "down" }, { status: 503 });
+        }
         return proxyWorker.fetch(request, bridge, createCtx());
+      }
       return upstreamFetch(input, init);
     };
-    const webhook = async (id: string, event: string, firstName?: string) =>
-      handleDsyncWebhook(
+    const webhook = async (id: string, event: string, firstName?: string) => {
+      const body = JSON.stringify({
+        id,
+        event,
+        data: {
+          directory_id: "directory_resolver",
+          id: "directory_user_new",
+          idp_id: "new@example.com",
+          email: "new@example.com",
+          state: event === "dsync.user.deleted" ? "inactive" : "active",
+          first_name: firstName,
+        },
+      });
+      const t = Date.now();
+      const mac = createHmac("sha256", "secret").update(`${t}.${body}`).digest("hex");
+      return handleDsyncWebhook(
         new Request("https://native.test/webhooks/dsync", {
           method: "POST",
-          body: JSON.stringify({
-            id,
-            event,
-            data: {
-              directory_id: "directory_resolver",
-              id: "directory_user_new",
-              idp_id: "new@example.com",
-              email: "new@example.com",
-              state: event === "dsync.user.deleted" ? "inactive" : "active",
-              first_name: firstName,
-            },
-          }),
+          headers: { "WorkOS-Signature": `t=${t},v1=${mac}` },
+          body,
         }),
         native.DB,
       );
+    };
+    // First attempt: the row is created, the callback fails, nothing is mapped.
+    expect((await webhook("birth", "dsync.user.created")).status).toBe(503);
+    expect(await store.userById(scimId)).toMatchObject({
+      user_name: "new@example.com",
+      external_id: null,
+      active: 1,
+    });
+    expect(await getMappingByWorkosId(native.DB, local.id, "Users", scimId)).toBeNull();
+    expect(await getEventLink(native.DB, local.id, "Users", "directory_user_new")).toBeNull();
+    expect(await getIdpAlias(bridge.DB, directory.id, "Users", scimId)).toMatchObject({
+      native_id: null,
+    });
+    expect(
+      await native.DB.prepare(
+        "SELECT COUNT(*) AS n FROM poc_config WHERE key LIKE 'native.pending_identity.%'",
+      ).first(),
+    ).toEqual({ n: 1 });
+    // The redelivery finds the row already there and still confirms it.
+    failCallback = false;
     expect((await webhook("birth", "dsync.user.created")).status).toBe(200);
-    const store = new ScimStore(native.DB, NATIVE_TABLES);
-    expect(await store.userById(scimId)).toMatchObject({ user_name: "new@example.com", active: 1 });
+    expect(callbacks).toHaveLength(2);
+    const callback = callbacks[1];
+    expect(callback.headers.has("X-SCIM-Bridge-Callback-Token")).toBe(false);
+    expect(callback.headers.get("Authorization")).toBe(`Bearer ${directory.proxy_token}`);
+    expect(JSON.parse(callback.body)).toEqual({
+      dsync_id: "directory_user_new",
+      native_id: scimId,
+      idp_id: "new@example.com",
+      userName: "new@example.com",
+    });
+    expect(nativeReads).toEqual([scimId]);
+    expect((await store.listUsers(null, 0, 100)).total).toBe(1);
+    expect(await getIdpAlias(bridge.DB, directory.id, "Users", scimId)).toMatchObject({
+      native_id: scimId,
+    });
+    expect(await getMappingByWorkosId(bridge.DB, directory.id, "Users", scimId)).toMatchObject({
+      native_id: scimId,
+    });
     expect(await getMappingByWorkosId(native.DB, local.id, "Users", scimId)).toMatchObject({
       native_id: scimId,
     });
+    expect(await getEventLink(native.DB, local.id, "Users", "directory_user_new")).toMatchObject({
+      native_id: scimId,
+      workos_id: scimId,
+    });
+    expect(
+      await native.DB.prepare(
+        "SELECT COUNT(*) AS n FROM poc_config WHERE key LIKE 'native.pending_identity.%'",
+      ).first(),
+    ).toEqual({ n: 0 });
     expect((await webhook("updated", "dsync.user.updated", "Updated")).status).toBe(200);
     expect(JSON.parse((await store.userById(scimId))!.resource).name).toEqual({
       givenName: "Updated",
@@ -369,11 +441,13 @@ describe("directory-authenticated event identity resolver", () => {
     ).toBe(204);
     await deletion.drain();
     expect(await getMappingByWorkosId(bridge.DB, directory.id, "Users", scimId)).toBeNull();
+    listing = [];
     fake!.route("workos", "GET", /^\/Users/, Response.json({ detail: "deleted" }, { status: 404 }));
     const callsBeforeDelete = fake!.calls.length;
     expect((await webhook("deleted", "dsync.user.deleted")).status).toBe(200);
     expect(await store.userById(scimId)).toMatchObject({ active: 0 });
     expect(fake!.calls).toHaveLength(callsBeforeDelete);
+    expect(callbacks).toHaveLength(2);
   });
 
   it("does not persist a second native owner for an already learned SCIM ID", async () => {

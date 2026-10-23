@@ -2,8 +2,9 @@ import { afterEach, describe, expect, it } from "vitest";
 import proxyWorker from "../workers/proxy/index";
 import { handleDsyncWebhook, processDsyncEvent } from "../workers/native/listener";
 import { NATIVE_TABLES, ScimStore } from "../workers/native/store";
-import { setConfig, upsertMapping } from "../workers/shared/db";
-import { bindEventLink } from "../workers/shared/event-links";
+import { getMappingByWorkosId, setConfig, upsertMapping } from "../workers/shared/db";
+import { bindEventLink, getEventLink } from "../workers/shared/event-links";
+import { getIdpAlias } from "../workers/shared/idp-aliases";
 import {
   createCtx,
   createEnv,
@@ -448,17 +449,25 @@ describe("listener verifies event SCIM identity before writing", () => {
     await ctx.drain();
     expect(created.status).toBe(201);
     expect(scimId).not.toBe("new@example.com");
-    fake!.route(
-      "workos",
-      "GET",
-      /^\/Users\?/,
+    // The IdP was told the public id, and only a pending alias backs it: no
+    // native mapping exists until the listener has created the row.
+    expect(((await created.json()) as { id: string }).id).toBe(scimId);
+    expect(await getIdpAlias(env.DB, directory.id, "Users", scimId)).toMatchObject({
+      workos_id: scimId,
+      native_id: null,
+    });
+    expect(await getMappingByWorkosId(env.DB, directory.id, "Users", scimId)).toBeNull();
+    // Every live-identity check (resolver, then alias lookup) sees one resource.
+    let listing: Record<string, unknown>[] = [
+      { id: scimId, userName: "new@example.com", active: true },
+    ];
+    fake!.route("workos", "GET", /^\/Users\?/, () =>
       Response.json({
-        totalResults: 1,
+        totalResults: listing.length,
         startIndex: 1,
-        itemsPerPage: 1,
-        Resources: [{ id: scimId, userName: "new@example.com", active: true }],
+        itemsPerPage: listing.length,
+        Resources: listing,
       }),
-      { once: true },
     );
 
     const response = await handleDsyncWebhook(
@@ -481,13 +490,27 @@ describe("listener verifies event SCIM identity before writing", () => {
 
     expect(response.status).toBe(200);
     expect(await store.userById(scimId)).toMatchObject({ user_name: "new@example.com", active: 1 });
+    // Shared database: confirmed in place by binding the alias under the claim.
+    expect(await getIdpAlias(env.DB, directory.id, "Users", scimId)).toMatchObject({
+      native_id: scimId,
+    });
+    expect(await getMappingByWorkosId(env.DB, directory.id, "Users", scimId)).toMatchObject({
+      native_id: scimId,
+    });
+    expect(await getEventLink(env.DB, directory.id, "Users", "directory_user_new")).toMatchObject({
+      native_id: scimId,
+      workos_id: scimId,
+    });
+    expect(
+      await env.DB.prepare(
+        "SELECT COUNT(*) AS n FROM poc_config WHERE key LIKE 'native.pending_identity.%'",
+      ).first(),
+    ).toEqual({ n: 0 });
+    expect(
+      await env.DB.prepare("SELECT COUNT(*) AS n FROM workos_primary_create_claims").first(),
+    ).toEqual({ n: 0 });
     expect((await store.listUsers(null, 0, 100)).total).toBe(1);
-    fake!.route(
-      "workos",
-      "GET",
-      /^\/Users\?/,
-      Response.json({ totalResults: 0, startIndex: 1, itemsPerPage: 0, Resources: [] }),
-    );
+    listing = [];
     fake!.route(
       "workos",
       "GET",

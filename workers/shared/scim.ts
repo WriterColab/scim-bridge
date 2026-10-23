@@ -550,6 +550,8 @@ export interface MirrorResult {
   /** Set only after a fresh POST returned 201 and its own resource id. An
    * adopted PUT/409 row must never be removed to compensate a refused create. */
   createdId?: string;
+  /** A recovery POST may have committed even when no response was received. */
+  mayHaveCreated?: boolean;
   /**
    * Set when the failure is an alias-mint refusal: the id is already another
    * resource's `workos_id`, so this is a permanent collision, not a transient
@@ -675,6 +677,7 @@ export async function mirrorUpsert(
   rawResource: Record<string, unknown>,
   sink?: MappingSink,
   serializeRecovery = false,
+  provisional?: NewMapping | null,
 ): Promise<MirrorResult> {
   // Every WorkOS-bound resource body funnels through here — live mirror,
   // backfill replay, and the workos-only create/replace legs — and does so after
@@ -683,10 +686,32 @@ export async function mirrorUpsert(
   // meaningful remove, and the reverse (WorkOS → native) replay stays verbatim.
   const resource = stripNulls(rawResource);
   const acc: Elapsed = { ms: 0 };
+  let mayHaveCreated = false;
   try {
+    if (provisional === undefined) {
+      const alias = await db
+        .prepare(
+          "SELECT idp_id, native_id FROM idp_aliases WHERE directory_id = ? AND resource_type = ? AND (idp_id = ? OR workos_id = ?) AND (native_id IS NULL OR native_id != ?)",
+        )
+        .bind(directory.id, kind, nativeId, nativeId, nativeId)
+        .first<{ idp_id: string; native_id: string | null }>();
+      if (alias)
+        return mintConflict(
+          `PUT /${kind}/${nativeId}`,
+          kind,
+          nativeId,
+          alias.native_id ?? alias.idp_id,
+          acc,
+        );
+    }
     // A resource WorkOS already knows: update it in place by the id it stored
     // (the shared migrated id, or a minted one for a fallback-post mapping).
-    const existing = await getMapping(db, directory.id, kind, nativeId);
+    const existing =
+      provisional === undefined
+        ? await getMapping(db, directory.id, kind, nativeId)
+        : provisional
+          ? { ...provisional, created_at: "", updated_at: "" }
+          : null;
     if (serializeRecovery && !existing) {
       return recoveryRefused(
         `PUT /${kind}/${nativeId}`,
@@ -780,7 +805,11 @@ export async function mirrorUpsert(
       }
     }
 
-    return createViaPost(db, directory, kind, nativeId, resource, acc, sink);
+    mayHaveCreated = true;
+    return {
+      ...(await createViaPost(db, directory, kind, nativeId, resource, acc, sink)),
+      mayHaveCreated: true,
+    };
   } catch (error) {
     return {
       ok: false,
@@ -789,6 +818,7 @@ export async function mirrorUpsert(
       ms: acc.ms || null,
       body: null,
       error: errorMessage(error),
+      mayHaveCreated,
     };
   }
 }
@@ -1036,6 +1066,20 @@ async function claimedByAnother(
   // legacy mappings. Queued competitors count even when the durable row is self.
   const claimed = await getMappingByWorkosId(db, directory.id, kind, workosId);
   if (claimed && claimed.native_id !== nativeId) return claimed;
+  const alias = await db
+    .prepare(
+      "SELECT idp_id, native_id, deleted FROM idp_aliases WHERE directory_id = ? AND resource_type = ? AND workos_id = ?",
+    )
+    .bind(directory.id, kind, workosId)
+    .first<{ idp_id: string; native_id: string | null; deleted: number }>();
+  if (alias && (alias.deleted || (alias.native_id ?? alias.idp_id) !== nativeId))
+    return {
+      directory_id: directory.id,
+      resource_type: kind,
+      native_id: alias.native_id ?? alias.idp_id,
+      workos_id: workosId,
+      strategy: "fallback-post",
+    };
   return (
     sink?.find(
       (m) =>

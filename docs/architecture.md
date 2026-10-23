@@ -124,9 +124,10 @@ comes from the IdP's `externalId`), not a conflict.
 The IdP never sees a WorkOS-internal id. When WorkOS doesn't honor the header
 (e.g. the `external_id` gate is off) the POST mints its own id; the proxy detects
 the diverging echoed id and records a `fallback-post` mapping instead so ids
-still translate in both directions. Resources born after cutover mint their id
-from the IdP `externalId`, so one shared id spans all three systems
-(rollback-safe).
+still translate in both directions. Resources born after cutover keep a stable IdP-facing alias, separate from
+WorkOS and native IDs. Identity confirms the actual native ID through an
+authenticated callback; the proxy translates the alias in every mode. See
+[Identity confirmations and rollback](identity-callback.md).
 
 ## Multi-directory
 

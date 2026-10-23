@@ -62,6 +62,13 @@ export async function setPanelDirectoryMode(
       );
     }
   }
-  await setDirectoryMode(db, directory.id, mode);
+  try {
+    await setDirectoryMode(db, directory.id, mode);
+  } catch (error) {
+    return {
+      error: error instanceof Error ? error.message : "Mode change failed",
+      ...(eventLinks ? { eventLinks } : {}),
+    };
+  }
   return eventLinks ? { eventLinks } : {};
 }

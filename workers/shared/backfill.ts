@@ -1,4 +1,5 @@
 import { preloadForOperation, type GroupEventLinkOptions } from "./event-link-preload";
+import { bindAliasNative, listIdpAliases } from "./idp-aliases";
 import type { Datastore } from "./datastore";
 import type { BackfillSummary, Directory, ResourceType } from "./types";
 import { getEventLinkByNativeId } from "./event-links";
@@ -371,8 +372,56 @@ export async function runReconcileFromWorkos(
       // Reconciliation addresses the whole directory, so reject every ambiguous
       // owner before snapshots or native writes.
       await loadIdMaps(db, directory.id, { strict: true });
+      const revision = await db
+        .prepare("SELECT rollback_revision FROM scim_directories WHERE id = ?")
+        .bind(directory.id)
+        .first<{ rollback_revision: number }>();
       const summary = await reconcileFromWorkos(db, directory, state);
       summary.eventLinks = eventLinks;
+      // A live snapshot cannot prove deletions reached native. Verify retained
+      // public identities separately before certifying rollback readiness.
+      for (const alias of await listIdpAliases(db, directory.id)) {
+        if (!alias.deleted) continue;
+        if (!alias.native_id) {
+          summary.errors.push(
+            `${alias.resource_type}/${alias.idp_id}: deletion has no confirmed native identity; operator recovery required`,
+          );
+          continue;
+        }
+        const native = await scimFetch(
+          joinScimUrl(
+            directory.native_url,
+            `/${alias.resource_type}/${encodeURIComponent(alias.native_id)}`,
+          ),
+          { method: "GET", token: directory.native_token },
+        );
+        const body = parseJson(native.bodyText);
+        if (
+          native.status !== 404 &&
+          !(
+            alias.resource_type === "Users" &&
+            isSuccess(native.status) &&
+            body?.id === alias.native_id &&
+            body.active === false
+          )
+        )
+          summary.errors.push(
+            `${alias.resource_type}/${alias.idp_id}: deletion has not converged on native`,
+          );
+      }
+      if (
+        !state.unresolvedWrite &&
+        summary.errors.length === 0 &&
+        summary.users.failed === 0 &&
+        summary.groups.failed === 0
+      ) {
+        await db
+          .prepare(
+            "UPDATE scim_directories SET rollback_verified_revision = rollback_revision WHERE id = ? AND rollback_revision = ? AND NOT EXISTS (SELECT 1 FROM idp_aliases WHERE directory_id = ? AND native_id IS NULL) AND NOT EXISTS (SELECT 1 FROM native_write_failures WHERE directory_id = ?)",
+          )
+          .bind(directory.id, revision?.rollback_revision, directory.id, directory.id)
+          .run();
+      }
       if (state.unresolvedWrite) {
         summary.errors.unshift(
           "Create claims retained: a native replay is unresolved. An operator must check both " +
@@ -717,7 +766,12 @@ async function pushToNative(
       );
       return;
     }
-    if (!current) {
+    const alias = (await listIdpAliases(db, directory.id)).find(
+      (a) => a.resource_type === kind && a.workos_id === workosId,
+    );
+    if (alias) {
+      await bindAliasNative(db, directory, alias, nativeId);
+    } else if (!current) {
       // An exception leaves both non-expiring claims held, even if the database
       // committed the mapping and only its acknowledgement was lost.
       await upsertMapping(db, {
