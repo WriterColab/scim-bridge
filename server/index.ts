@@ -35,6 +35,8 @@ import { openPostgres, PostgresDatastore, PostgresMigrator } from "./db/postgres
 import { runMigrations } from "./db/migrate";
 import { backfillProxyTokenHashes } from "../workers/shared/db";
 import type { Datastore, DatastoreMigrator } from "../workers/shared/datastore";
+import { registerServerHttpClients } from "../workers/shared/http-clients";
+import { createTrustedHttpTransport, restrictOrigins } from "./http-transport";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const MIGRATIONS_DIR = join(ROOT, "migrations");
@@ -45,6 +47,14 @@ const CLIENT_DIR = join(ROOT, "build/client");
 const SERVER_BUILD = join(ROOT, "build/server/index.js");
 
 const config = loadConfig();
+const httpTransport = createTrustedHttpTransport();
+const loopbackOrigin = new URL(demoEventsUrl(config)).origin;
+registerServerHttpClients({
+  workos: restrictOrigins(httpTransport.fetch, ["https://api.workos.com"]),
+  events: restrictOrigins(httpTransport.fetch, [config.workosEventsUrl, demoEventsUrl(config)]),
+  bridge: restrictOrigins(httpTransport.fetch, [config.bridgeStatusUrl ?? loopbackOrigin]),
+  simulator: restrictOrigins(httpTransport.fetch, [loopbackOrigin]),
+});
 
 // Datastore: build the configured driver, apply its migrations, and hand every
 // `env.DB` consumer the same narrow interface.
@@ -268,37 +278,44 @@ if (config.role === "native-app") {
 
 const listener = getRequestListener(app.fetch, { hostname: "0.0.0.0" });
 // The scheme is fixed where the request enters, so nothing downstream rebuilds it.
-createServer(config.trustProxy ? withForwardedProto(listener) : listener).listen(
-  config.port,
-  "0.0.0.0",
-  () => {
-    console.log(`scim-bridge listening on http://0.0.0.0:${config.port}`);
-    if (config.role === "native-app") {
-      console.log(`  native SCIM base URL: ${config.publicUrl}/scim/v2`);
-      console.log(`  DSync webhook URL: ${config.publicUrl}/webhooks/dsync`);
-    } else {
-      console.log(`  control panel: ${config.publicUrl}/panel`);
-      console.log(`  SCIM base URL: ${config.publicUrl}/scim/v2`);
-      // Loud on every boot, not once at setup: an operator who set this to get
-      // past the refusal, meaning to put a proxy in front, should be reminded
-      // every time the container restarts until they have.
-      if (config.panelAuthDisabled) {
-        console.warn(
-          "  WARNING: PANEL_AUTH_DISABLED=true — /panel is unauthenticated and serves " +
-            "every directory's native and WorkOS bearer tokens to anyone who can reach it.",
-        );
-      }
-      // Same cadence as the panel-auth warning: an operator who turned this off to
-      // script the panel should be reminded every restart until they turn it back on.
-      if (config.panelCsrfDisabled) {
-        console.warn(
-          "  WARNING: PANEL_CSRF_DISABLED=true — panel mutations are not checked for a same-origin " +
-            "initiator, so a logged-in operator's browser can be made to forge them cross-site.",
-        );
-      }
+const server = createServer(config.trustProxy ? withForwardedProto(listener) : listener);
+server.listen(config.port, "0.0.0.0", () => {
+  console.log(`scim-bridge listening on http://0.0.0.0:${config.port}`);
+  if (config.role === "native-app") {
+    console.log(`  native SCIM base URL: ${config.publicUrl}/scim/v2`);
+    console.log(`  DSync webhook URL: ${config.publicUrl}/webhooks/dsync`);
+  } else {
+    console.log(`  control panel: ${config.publicUrl}/panel`);
+    console.log(`  SCIM base URL: ${config.publicUrl}/scim/v2`);
+    // Loud on every boot, not once at setup: an operator who set this to get
+    // past the refusal, meaning to put a proxy in front, should be reminded
+    // every time the container restarts until they have.
+    if (config.panelAuthDisabled) {
+      console.warn(
+        "  WARNING: PANEL_AUTH_DISABLED=true — /panel is unauthenticated and serves " +
+          "every directory's native and WorkOS bearer tokens to anyone who can reach it.",
+      );
     }
-    if (config.trustProxy) {
-      console.log("  TRUST_PROXY on: X-Forwarded-Proto=https marks a request as https");
+    // Same cadence as the panel-auth warning: an operator who turned this off to
+    // script the panel should be reminded every restart until they turn it back on.
+    if (config.panelCsrfDisabled) {
+      console.warn(
+        "  WARNING: PANEL_CSRF_DISABLED=true — panel mutations are not checked for a same-origin " +
+          "initiator, so a logged-in operator's browser can be made to forge them cross-site.",
+      );
     }
-  },
-);
+  }
+  if (config.trustProxy) {
+    console.log("  TRUST_PROXY on: X-Forwarded-Proto=https marks a request as https");
+  }
+});
+
+for (const signal of ["SIGINT", "SIGTERM"] as const) {
+  process.once(signal, () => {
+    eventsPoller.stop();
+    server.closeIdleConnections();
+    server.close(() => {
+      void httpTransport.close().finally(() => process.exit(0));
+    });
+  });
+}

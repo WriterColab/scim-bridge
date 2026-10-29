@@ -1,6 +1,7 @@
 import { deleteConfig, getConfig, setConfig } from "../shared/db";
 import type { Datastore } from "../shared/datastore";
 import { processDsyncEvent, recordEvent } from "./listener";
+import { eventsHttpFetch } from "../shared/http-clients";
 
 /**
  * The Events API polling transport: the ordered alternative to webhooks.
@@ -105,11 +106,12 @@ export async function pollDsyncEventsOnce(
     url.searchParams.set("limit", String(limit));
     if (cursor) url.searchParams.set("after", cursor);
 
-    const response = await fetch(url, {
+    const response = await eventsHttpFetch(url, {
       headers: { Authorization: `Bearer ${options.apiKey}` },
       signal: AbortSignal.timeout(options.fetchTimeoutMs ?? EVENTS_FETCH_TIMEOUT_MS),
     });
     if (response.status === 400 && cursor) {
+      await response.body?.cancel();
       // The API no longer recognises the cursor — real WorkOS retains events
       // for a bounded window, so a poller that was down long enough comes back
       // holding an id the API has forgotten. Staying dead is the one wrong
@@ -124,6 +126,7 @@ export async function pollDsyncEventsOnce(
       continue;
     }
     if (!response.ok) {
+      await response.body?.cancel();
       throw new Error(`events API answered ${response.status} for GET ${base}/events`);
     }
     const page = (await response.json()) as EventsPage;

@@ -1,5 +1,6 @@
 import { getConfig } from "../../../workers/shared/db";
 import type { Datastore } from "../../../workers/shared/datastore";
+import { simulatorHttpFetch } from "../../../workers/shared/http-clients";
 
 const DEFAULT_IDP_URL = "http://localhost:8789";
 
@@ -17,7 +18,7 @@ export async function callIdpSimulator(
   const base = ((await getConfig(db, "idp.public_url")) ?? DEFAULT_IDP_URL).replace(/\/+$/, "");
   let response: Response;
   try {
-    response = await fetch(`${base}/${endpoint}`, {
+    response = await simulatorHttpFetch(`${base}/${endpoint}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),

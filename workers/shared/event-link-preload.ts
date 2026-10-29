@@ -2,6 +2,7 @@ import type { Datastore } from "./datastore";
 import type { Directory } from "./types";
 import { EventMappingError, learnEventLink, type EventMappingReason } from "./event-mapping";
 import { isRecord } from "./scim";
+import { workosHttpFetch } from "./http-clients";
 
 export interface GroupEventLinkSummary {
   total: number;
@@ -51,7 +52,7 @@ export async function preloadGroupEventLinks(
       if (after) url.searchParams.set("after", after);
       let response: Response;
       try {
-        response = await fetch(url, {
+        response = await workosHttpFetch(url, {
           headers: { Authorization: `Bearer ${apiKey}` },
           redirect: "manual",
           signal: AbortSignal.timeout(2_000),
@@ -59,10 +60,12 @@ export async function preloadGroupEventLinks(
       } catch {
         throw new EventMappingError("upstream_unavailable");
       }
-      if (!response.ok)
+      if (!response.ok) {
+        await response.body?.cancel();
         throw new EventMappingError(
           response.status >= 500 ? "upstream_unavailable" : "identity_unconfirmed",
         );
+      }
       let page: unknown;
       try {
         page = await response.json();

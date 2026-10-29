@@ -6,6 +6,7 @@ import { bindEventLink } from "../shared/event-links";
 import type { Datastore } from "../shared/datastore";
 import type { Directory, ResourceType } from "../shared/types";
 import type { DirectoryStatus } from "../proxy/status";
+import { bridgeHttpFetch } from "../shared/http-clients";
 
 /** How long a fetched status stays fresh before revalidating. Matches the
  *  endpoint's Cache-Control so a mode flip propagates within seconds. */
@@ -99,13 +100,16 @@ export async function fetchDirectoryStatus(
   const token = await clientTokenFor(db, directory.id);
   if (!token) return staleAnswer;
   try {
-    const response = await fetch(`${base}/status/directories/${encodeURIComponent(directory.id)}`, {
-      headers: {
-        Authorization: `Bearer ${token}`,
-        ...(cached?.etag ? { "If-None-Match": cached.etag } : {}),
+    const response = await bridgeHttpFetch(
+      `${base}/status/directories/${encodeURIComponent(directory.id)}`,
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          ...(cached?.etag ? { "If-None-Match": cached.etag } : {}),
+        },
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
       },
-      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-    });
+    );
     if (response.status === 304 && cached) {
       // A 304 is the origin confirming the entry we hold, so it counts as a
       // validation — including for a `validatedSince` caller, whose question
@@ -115,6 +119,7 @@ export async function fetchDirectoryStatus(
       return cached.status;
     }
     if (!response.ok) {
+      await response.body?.cancel();
       failedUntil.set(directory.id, now + TTL_MS);
       return staleAnswer;
     }
@@ -156,14 +161,17 @@ export async function fetchEventNativeId(
   const raw = isRecord(resource.raw_attributes) ? resource.raw_attributes : {};
   if (existingOnly) query.set("existing_only", "1");
   if (typeof raw.externalId === "string" && raw.externalId) query.set("externalId", raw.externalId);
-  const response = await fetch(
+  const response = await bridgeHttpFetch(
     `${base}/status/directories/${encodeURIComponent(directory.id)}/event-mapping/${kind}?${query}`,
     {
       headers: { Authorization: `Bearer ${token}` },
       signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     },
   );
-  if (!response.ok) throw new Error(`Bridge event mapping resolver returned ${response.status}`);
+  if (!response.ok) {
+    await response.body?.cancel();
+    throw new Error(`Bridge event mapping resolver returned ${response.status}`);
+  }
   const mapping: unknown = await response.json();
   if (
     !isRecord(mapping) ||

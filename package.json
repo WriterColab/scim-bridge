@@ -16,6 +16,7 @@
     "format:check": "oxfmt --check app server workers tests deploy package.json postcss.config.mjs vite.config.ts react-router.config.ts",
     "verify": "npm run typecheck && npm run build",
     "test": "vitest run --coverage --reporter=default --reporter=json --outputFile=.vitest/sqlite.json",
+    "test:egress": "vitest run tests/http-transport.test.ts tests/events-poller.test.ts tests/event-mapping-groups.test.ts tests/listener.test.ts tests/idp-routes.test.ts",
     "test:postgres": "cross-env TEST_ENGINE=postgres vitest run --reporter=default --reporter=json --outputFile=.vitest/postgres.json",
     "test:engines": "node scripts/check-engine-parity.mjs"
   },
@@ -37,6 +38,7 @@
     "react-dom": "^19.3.0",
     "react-router": "^8.3.0",
     "tsx": "^4.23.13",
+    "undici": "7.30.1",
     "zod": "^4.6.5"
   },
   "devDependencies": {
