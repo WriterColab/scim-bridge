@@ -4,6 +4,7 @@ import { isRecord, isSuccess, joinScimUrl, parseJson, scimFetch } from "./scim";
 import { bindEventLink, EventLinkConflictError, getEventLink } from "./event-links";
 import type { Datastore } from "./datastore";
 import type { Directory, IdMapping, ResourceType } from "./types";
+import { workosHttpFetch } from "./http-clients";
 
 export type EventMappingReason =
   | "no_link"
@@ -270,7 +271,7 @@ export async function verifyDsyncEventIdentity(
     throw new EventMappingError("identity_unconfirmed");
   let response: Response;
   try {
-    response = await fetch(
+    response = await workosHttpFetch(
       `https://api.workos.com/${kind === "Users" ? "directory_users" : "directory_groups"}/${encodeURIComponent(id)}`,
       {
         headers: { Authorization: `Bearer ${apiKey}` },
@@ -280,8 +281,14 @@ export async function verifyDsyncEventIdentity(
   } catch {
     throw new EventMappingError("upstream_unavailable");
   }
-  if (response.status === 404) throw new EventMappingError("dsync_resource_gone");
-  if (!response.ok) throw scimLookupFailure(response.status);
+  if (response.status === 404) {
+    await response.body?.cancel();
+    throw new EventMappingError("dsync_resource_gone");
+  }
+  if (!response.ok) {
+    await response.body?.cancel();
+    throw scimLookupFailure(response.status);
+  }
   let current: unknown;
   try {
     current = await response.json();
