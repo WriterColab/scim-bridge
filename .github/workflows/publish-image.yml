@@ -39,6 +39,9 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    outputs:
+      tag: ${{ steps.tag.outputs.value }}
+      digest: ${{ steps.digest.outputs.digest }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -101,3 +104,56 @@ jobs:
           gcloud --quiet auth configure-docker us-docker.pkg.dev
           docker push "$IMAGE:$TAG"
           echo "Published: \`$IMAGE:$TAG\`" >> "$GITHUB_STEP_SUMMARY"
+      # Digest of the bytes just pushed, so mirror-ecr copies exactly this build. An
+      # empty digest only fails the non-blocking mirror-ecr job.
+      - name: Record pushed digest
+        id: digest
+        continue-on-error: true
+        env:
+          TAG: ${{ steps.tag.outputs.value }}
+        run: |
+          digest=$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$IMAGE:$TAG" \
+            | sed -n "s|^$IMAGE@||p" | head -n 1)
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+  # Copies the pushed image to the AWS ECR hub by digest. GAR stays the deploy source,
+  # so a failed copy never fails the run. The hub grant (aws-git-roles) admits main
+  # only, which is the only ref the checks job lets publish. ECR tags are immutable:
+  # republishing an existing x.y.z-suffix tag with new bytes moves GAR but fails here.
+  mirror-ecr:
+    needs: publish
+    if: >-
+      github.ref == 'refs/heads/main'
+      && github.event_name == 'workflow_dispatch'
+      && needs.publish.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: true # ECR-GO-LIVE: blocking only once a deploy reads from ECR
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Require pushed digest
+        env:
+          DIGEST: ${{ needs.publish.outputs.digest }}
+        run: |
+          if [[ -z "$DIGEST" ]]; then
+            echo "::error::publish did not record a digest for the pushed image."
+            exit 1
+          fi
+
+      - uses: WriterInternal/devops-github-actions/mirror-image-to-ecr@95175a9b5dbc2d00f53c7aeaeb08c472717fdf61 # release/v2
+        with:
+          image: scim-bridge
+          tag: ${{ needs.publish.outputs.tag }}
+          expected-digest: ${{ needs.publish.outputs.digest }}
+          required-platforms: linux/amd64
+          gcp-workload-identity-provider: projects/788018447969/locations/global/workloadIdentityPools/writer-iam-wip/providers/github-gar-write-20240221
+          gcp-service-account: github-gar-write-20240221@writer-iam.iam.gserviceaccount.com
+          role-arn: arn:aws:iam::462783693401:role/writer-gha-ecr-push-role
+
+      - name: Flag a failed mirror
+        if: failure() || cancelled()
+        run: |
+          echo "::warning::ECR mirror failed or timed out. GAR publication is unaffected."
+          echo "ECR mirror failed or timed out. GAR publication is unaffected." >> "$GITHUB_STEP_SUMMARY"
