@@ -602,6 +602,7 @@ describe("proxy routing", () => {
 
     it("answers a PUT replace with 200 in native-id space", async () => {
       const directory = await seedDirectory(env.DB, { mode: "workos-only" });
+      await seedMapping(env, directory, "n9", "n9");
       fake.route("workos", "PUT", "/Users/n9", scimJson(200, { id: "n9", userName: "a@b.c" }));
 
       const res = await proxyWorker.fetch(
@@ -766,6 +767,13 @@ describe("proxy routing", () => {
 
     it("strips nulls on the workos-only write leg too", async () => {
       const directory = await seedDirectory(env.DB, { mode: "workos-only" });
+      await upsertMapping(env.DB, {
+        directory_id: directory.id,
+        resource_type: "Groups",
+        native_id: "g1",
+        workos_id: "g1",
+        strategy: "migrated-id",
+      });
       fake.route("workos", "PUT", "/Groups/g1", scimJson(200, { id: "g1" }));
 
       const ctx = createCtx();

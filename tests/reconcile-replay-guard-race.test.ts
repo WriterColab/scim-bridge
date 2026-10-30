@@ -214,26 +214,17 @@ describe("PR #73's replay guard under a mid-reconcile create", () => {
 
     const summary = await runReconcileFromWorkos(env.DB, await reload(env.DB, scenario.attacker));
 
-    // The create succeeded and minted the mapping that silences the guard: its
-    // native_id is a random id of the attacker's own, its workos_id is the
-    // victim's native id.
-    expect(plantStatus).toBe(201);
+    // Reconciliation fences new public identities until its snapshot is settled.
+    expect(plantStatus).toBe(503);
     const mapping = await env.DB.prepare(
-      "SELECT native_id, workos_id, strategy FROM id_mappings WHERE directory_id = ? AND workos_id = ?",
+      "SELECT native_id FROM id_mappings WHERE directory_id = ? AND workos_id = ?",
     )
       .bind(scenario.attacker.id, "vic-1")
-      .first<{ native_id: string; workos_id: string; strategy: string }>();
-    expect(mapping).toMatchObject({ workos_id: "vic-1", strategy: "fallback-post" });
-    expect(mapping?.native_id).not.toBe("vic-1");
-
-    // The replay is addressed from that same mapping rather than the snapshot's
-    // identity fallback, so the co-tenant's row is left exactly as it was.
+      .first();
+    expect(mapping).toBeNull();
+    expect(summary.users).toMatchObject({ total: 2, mirrored: 1, failed: 1 });
     expect(scenario.native.users.get("vic-1")).toEqual(VICTIM_ROW);
     const victimView = await send(env, scenario.victim, "GET", "/scim/v2/Users/vic-1");
     expect(await victimView.json()).toMatchObject(VICTIM_ROW);
-    // The attacker's own row is written where their own mapping says it lives.
-    expect(scenario.native.users.get(mapping!.native_id)).toMatchObject({
-      userName: PLANT_USERNAME,
-    });
   });
 });

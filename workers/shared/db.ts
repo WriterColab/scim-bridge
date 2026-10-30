@@ -412,13 +412,69 @@ export async function setDirectoryWorkosDirectoryId(
   );
 }
 
+export class RollbackNotReadyError extends Error {}
+
 export async function setDirectoryMode(db: Datastore, id: string, mode: Mode): Promise<void> {
-  await withDatastoreRetry(() =>
-    db
-      .prepare("UPDATE scim_directories SET mode = ?, updated_at = datetime('now') WHERE id = ?")
-      .bind(mode, id)
-      .run(),
-  );
+  const current = await getDirectoryById(db, id);
+  if (!current) throw new RollbackNotReadyError("Directory no longer exists");
+  const rollback = current.mode === "workos-only" && mode !== "workos-only";
+  const token = crypto.randomUUID();
+  try {
+    if (rollback) {
+      for (const kind of ["Users", "Groups"] as const) {
+        if (!(await claimWorkosPrimaryCreate(db, id, kind, token)))
+          throw new RollbackNotReadyError(
+            "A create, Identity callback, or reconcile is unresolved; retry after it settles",
+          );
+      }
+      const pending = await db
+        .prepare(
+          "SELECT COUNT(*) AS count FROM idp_aliases WHERE directory_id = ? AND native_id IS NULL",
+        )
+        .bind(id)
+        .first<{ count: number }>();
+      const failures = await db
+        .prepare("SELECT COUNT(*) AS count FROM native_write_failures WHERE directory_id = ?")
+        .bind(id)
+        .first<{ count: number }>();
+      if (Number(pending?.count) || Number(failures?.count))
+        throw new RollbackNotReadyError(
+          "Rollback requires confirmed native mappings and no native write failures. Wait for Identity, reconcile, and resolve retained deletions first.",
+        );
+      const readiness = await db
+        .prepare(
+          "SELECT rollback_revision, rollback_verified_revision, (SELECT COUNT(*) FROM idp_aliases WHERE directory_id = ?) AS aliases FROM scim_directories WHERE id = ?",
+        )
+        .bind(id, id)
+        .first<{
+          rollback_revision: number;
+          rollback_verified_revision: number | null;
+          aliases: number;
+        }>();
+      if (
+        Number(readiness?.aliases) &&
+        (readiness?.rollback_verified_revision === null ||
+          readiness?.rollback_verified_revision !== readiness?.rollback_revision)
+      )
+        throw new RollbackNotReadyError(
+          "Pause provisioning, drain Identity events, and complete Reconcile from WorkOS before rollback",
+        );
+    }
+    const result = await withDatastoreRetry(() =>
+      db
+        .prepare(
+          "UPDATE scim_directories SET mode = ?, updated_at = datetime('now') WHERE id = ? AND mode = ?",
+        )
+        .bind(mode, id, current.mode)
+        .run(),
+    );
+    if (!result.meta.changes)
+      throw new RollbackNotReadyError("Directory mode changed; reload before retrying");
+  } finally {
+    if (rollback)
+      for (const kind of ["Users", "Groups"] as const)
+        await releaseWorkosPrimaryCreate(db, id, kind, token);
+  }
 }
 
 /** Whether this directory's proxy requests should be written to proxy_log. Off
@@ -608,8 +664,26 @@ function upsertMappingStatement(db: Datastore, mapping: NewMapping) {
     );
 }
 
+function updateAliasWorkosStatement(db: Datastore, mapping: NewMapping) {
+  return db
+    .prepare(
+      "UPDATE idp_aliases SET workos_id = ? WHERE directory_id = ? AND resource_type = ? AND native_id = ? AND deleted = 0",
+    )
+    .bind(mapping.workos_id, mapping.directory_id, mapping.resource_type, mapping.native_id);
+}
+
 export async function upsertMapping(db: Datastore, mapping: NewMapping): Promise<void> {
-  await withDatastoreRetry(() => upsertMappingStatement(db, mapping).run());
+  const alias = await db
+    .prepare(
+      "SELECT idp_id FROM idp_aliases WHERE directory_id = ? AND resource_type = ? AND native_id = ?",
+    )
+    .bind(mapping.directory_id, mapping.resource_type, mapping.native_id)
+    .first();
+  if (alias)
+    await withDatastoreRetry(() =>
+      db.batch([upsertMappingStatement(db, mapping), updateAliasWorkosStatement(db, mapping)]),
+    );
+  else await withDatastoreRetry(() => upsertMappingStatement(db, mapping).run());
 }
 
 /**
@@ -631,8 +705,33 @@ export async function upsertMapping(db: Datastore, mapping: NewMapping): Promise
  */
 export async function upsertMappings(db: Datastore, mappings: NewMapping[]): Promise<void> {
   if (mappings.length === 0) return;
+  const directories = [...new Set(mappings.map((m) => m.directory_id))];
+  const aliases = (
+    await Promise.all(
+      directories.map((id) =>
+        db
+          .prepare(
+            "SELECT resource_type, native_id, directory_id FROM idp_aliases WHERE directory_id = ? AND native_id IS NOT NULL",
+          )
+          .bind(id)
+          .all<{ resource_type: string; native_id: string; directory_id: string }>(),
+      ),
+    )
+  ).flatMap((r) => r.results);
   await withDatastoreRetry(() =>
-    db.batch(mappings.map((mapping) => upsertMappingStatement(db, mapping))),
+    db.batch(
+      mappings.flatMap((mapping) => [
+        upsertMappingStatement(db, mapping),
+        ...(aliases.some(
+          (a) =>
+            a.directory_id === mapping.directory_id &&
+            a.resource_type === mapping.resource_type &&
+            a.native_id === mapping.native_id,
+        )
+          ? [updateAliasWorkosStatement(db, mapping)]
+          : []),
+      ]),
+    ),
   );
 }
 

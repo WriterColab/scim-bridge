@@ -473,3 +473,13 @@ mock WorkOS the demo bridge itself mounts (which serves the same `GET /events`
 contract), and no API key is needed — the mock authenticates with its own
 seeded token. Keyless polling works only against that bundled mock; pointing
 the poller anywhere else still requires `WORKOS_API_KEY`.
+
+## Confirming native creation
+
+Listeners that assign their own native IDs must report them after successful
+creation or idempotent recovery. The event-mapping GET may now return a verified
+`status: "pending"` response without `native_id`. Do not interpret its public
+`idp_id` as an established native association. See the
+[callback contract](identity-callback.md) for service authentication, retries,
+and the resolved response. Existing-only lookup remains restricted to retained
+verified event links.
